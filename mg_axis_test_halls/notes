@@ -1,0 +1,47 @@
+First, set up wifimanager library to connect to the internet.
+In the serial terminal post the ip address of the esp32 and save it
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+the ip read from esp after wifimanager connected: 192.168.5.102 
+
+Now because I want to host my own mqtt stuff I need to set up a broker
+This is running on my laptop, which is running ubuntu 22.04 in WSL2
+MQTT BROKER NOTES ------------------------------------------------------
+
+Making a linux machine as a broker
+mosquitto seems like a reasonable choice?
+    sudo apt install mosquitto mosquitto-clients
+    sudo systemctl start mosquitto
+To make a broker start on boot use:
+    sudo systemctl enable mosquitto
+
+Edited the mosquitto.conf file because of wsl2
+    # In order to make this work with more than just WSL2:
+    # bind to address 0.0.0.0 and listen on port 1883
+    listener 1883 0.0.0.0
+
+Added a user to the mosquitto broker
+    sudo mosquitto_passwd -c /etc/mosquitto/passwd <username>
+    # replace -c with -b if you are adding a user to an existing file
+
+(remember to restart mosquitto when editing .conf file)
+    sudo systemctl restart mosquitto
+
+might have to stop mosquitto and force it to start with the config file
+    sudo systemctl stop mosquitto
+    sudo mosquitto -c /etc/mosquitto/mosquitto.conf -v
+
+END OF MQTT BROKER NOTES -----------------------------------------------
+
+
+now, the WSL2 address I'm reading is: 
+    172.22.59.90  -- This is the address of the broker
+            1883  -- This is the port we configured for the broker
+We can give this to the Axis to start testing the connection
+We can also test and look at things with the app "MQTT Explorer"
+
+But back on the ESP32 side, for the MotorGo Axis:
+I'll use the PubSubClient library by Nick O'Leary
+and we'll package it into json with ArduinoJson to send the data
+
