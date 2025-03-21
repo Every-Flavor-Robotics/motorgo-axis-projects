@@ -10,7 +10,7 @@
 #include "axis_mqtt_tools.h"    // Include our WiFi header
 #include "axis_wifi_manager.h"  // Include our MQTT header
 #include "pins_arduino.h"       // Include our custom pins for AXIS board
-#define VERSION "1.0.12"        // updated dynamically from python script
+#define VERSION "1.0.16"        // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -43,11 +43,15 @@ std::atomic<float> command_pos_i_gain = 0;
 std::atomic<float> command_pos_d_gain = 0;
 std::atomic<float> command_pos_lpf = 0;
 
+std::atomic<bool> enable_flag = false;
+std::atomic<bool> disable_flag = false;
+std::atomic<bool> motors_enabled = false;
+
 // 0 for torque, 1 for velocity, 2 for position
 std::atomic<uint> last_commanded_mode = 0;
 
 // make a separate thread for the OTA
-TaskHandle_t arduino_ota_task;
+TaskHandle_t loop_foc_task;
 // make a separate thread for the MQTT publishing
 TaskHandle_t mqtt_publish_task;
 const int interval_ms = 500;
@@ -97,14 +101,32 @@ void mqtt_publish_thread(void *pvParameters)
   }
 }
 
-void ota_loop_thread(void *pvParameters)
+void loop_foc_thread(void *pvParameters)
 {
   while (1)
   {
-    ArduinoOTA.handle();
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    // Service flags
+    if (enable_flag)
+    {
+      //   Serial.println("Motors are enabled");
+      motor.enable();
+      enable_flag.store(false);
+      motors_enabled.store(true);
+    }
+    else if (disable_flag)
+    {
+      //   Serial.println("Motors are disabled");
+      motor.disable();
+      disable_flag.store(false);
+      motors_enabled.store(false);
+    }
+
+    // loop simplefoc
+    motor.move(last_commanded_target.load());
+    motor.loopFOC();
   }
 }
+
 void setup()
 {
   Serial.begin(115200);
@@ -130,6 +152,16 @@ void setup()
           type = "filesystem";
         }
         Serial.println("Start updating " + type);
+      });
+
+  ArduinoOTA.onStart(
+      []()
+      {
+        // Stop motors on OTA
+        disable_flag.store(true);
+
+        // Wait to make sure they stop
+        delay(100);
       });
 
   ArduinoOTA.onEnd([]() { Serial.println("\nEnd OTA Update"); });
@@ -209,8 +241,8 @@ void setup()
                           1); /* Core 1 because wifi runs on core 0 */
 
   // task for arduinoOTA
-  xTaskCreatePinnedToCore(ota_loop_thread, "OTA_Handler", 10000, NULL, 1,
-                          &arduino_ota_task, 1);
+  xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
+                          &loop_foc_task, 1);
 
   Serial.println("Setup complete.");
 }
@@ -219,9 +251,15 @@ void loop()
 {
   // if commands have changed, disable the motor, update the values, and
   // re-enable the motor
-  if (last_commanded_mode != motor.controller)
+  if (last_commanded_mode.load() != motor.controller)
   {
-    motor.disable();
+    disable_flag.store(true);
+    delay(1);
+    while (motors_enabled.load())
+    {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+
     uint controlmode = (MotionControlType)last_commanded_mode.load();
     switch (controlmode)
     {
@@ -238,9 +276,11 @@ void loop()
         motor.controller = MotionControlType::torque;
         break;
     }
-    motor.enable();
+    enable_flag.store(true);
   }
 
+  //   if the gains have changed, disable the motor, update the values, and
+  //   re-enable the motor
   if ((command_vel_p_gain.load() != motor.PID_velocity.P) ||
       (command_vel_i_gain.load() != motor.PID_velocity.I) ||
       (command_vel_d_gain.load() != motor.PID_velocity.D) ||
@@ -250,7 +290,13 @@ void loop()
       (command_pos_d_gain.load() != motor.P_angle.D) ||
       (command_pos_lpf.load() != motor.LPF_angle.Tf))
   {
-    motor.disable();
+    disable_flag.store(true);
+    delay(1);
+    while (motors_enabled.load())
+    {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+
     motor.PID_velocity.P = command_vel_p_gain.load();
     motor.PID_velocity.I = command_vel_i_gain.load();
     motor.PID_velocity.D = command_vel_d_gain.load();
@@ -259,12 +305,11 @@ void loop()
     motor.P_angle.I = command_pos_i_gain.load();
     motor.P_angle.D = command_pos_d_gain.load();
     motor.LPF_angle.Tf = command_pos_lpf.load();
-    motor.enable();
+    enable_flag.store(true);
   }
 
-  // loop simplefoc
-  motor.move(last_commanded_target.load());
-  motor.loopFOC();
-
   vTaskDelay(10 / portTICK_PERIOD_MS);
+
+  //   Handle OTA updates
+  ArduinoOTA.handle();
 }
