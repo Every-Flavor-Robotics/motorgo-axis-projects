@@ -1,25 +1,29 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <FreeRTOS.h>
-#include <wifi.h>
-#include "axis_mqtt_tools.h"   // Include our WiFi header
-#include "axis_wifi_manager.h" // Include our MQTT header
-#include "pins_arduino.h"      // Include our custom pins for AXIS board
 #include <SimpleFOC.h>
+#include <wifi.h>
+
 #include <atomic>
 
-#include <ArduinoOTA.h>
-#define VERSION "1.0.6" // updated dynamically from python script
+#include "axis_mqtt_tools.h"    // Include our WiFi header
+#include "axis_wifi_manager.h"  // Include our MQTT header
+#include "pins_arduino.h"       // Include our custom pins for AXIS board
+#define VERSION "1.0.12"        // updated dynamically from python script
 
-#include "encoders/mt6701/MagneticSensorMT6701SSI.h"
 #include "encoders/calibrated/CalibratedSensor.h"
+#include "encoders/mt6701/MagneticSensorMT6701SSI.h"
 
 // motor parameters
 int pole_pairs = 11;
+float phase_resistance = 0.1088;
+float kv = 500;
 
-// make a motor instance in simplefoc for the open loop test
-BLDCMotor motor = BLDCMotor(pole_pairs);
-BLDCDriver6PWM driver = BLDCDriver6PWM(CH0_UH, CH0_UL, CH0_VH, CH0_VL, CH0_WH, CH0_WL);
+// Setup the motor and driver
+BLDCMotor motor = BLDCMotor(pole_pairs, phase_resistance, kv);
+BLDCDriver6PWM driver =
+    BLDCDriver6PWM(CH0_UH, CH0_UL, CH0_VH, CH0_VL, CH0_WH, CH0_WL);
 
 // make encoder for simplefoc
 SPIClass hspi = SPIClass(HSPI);
@@ -27,7 +31,6 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 
 // calibrated sensor object from simplefoc
 CalibratedSensor sensor = CalibratedSensor(encoder0);
-
 
 // global atomic variable for the motor stuff to be set by mqtt
 std::atomic<float> last_commanded_target = 0;
@@ -52,19 +55,17 @@ void mqtt_publish_thread(void *pvParameters)
 {
   while (1)
   {
-
     static unsigned long lastMsg = millis();
     // Handle MQTT connection
     if (!isMQTTConnected())
-    {                  // Use our MQTT connection check function
-      reconnectMQTT(); // Use our MQTT reconnect function
+    {                   // Use our MQTT connection check function
+      reconnectMQTT();  // Use our MQTT reconnect function
     }
-    mqttLoop(); // Handle MQTT client loop (IMPORTANT)
+    mqttLoop();  // Handle MQTT client loop (IMPORTANT)
 
     // Publish data periodically
     if (millis() - lastMsg > interval_ms)
     {
-
       // Create JSON document to send data in
       StaticJsonDocument<512> doc;
 
@@ -75,10 +76,10 @@ void mqtt_publish_thread(void *pvParameters)
       // print the encoder velocity
       doc["vel"] = motor.shaft_velocity;
 
-      //print the gains
+      // print the gains
       doc["vel_p"] = motor.PID_velocity.P;
       doc["vel_i"] = motor.PID_velocity.I;
-      doc["vel_d"] = motor.PID_velocity.D; 
+      doc["vel_d"] = motor.PID_velocity.D;
       doc["vel_lpf"] = motor.LPF_velocity.Tf;
       doc["pos_p"] = motor.P_angle.P;
       doc["pos_i"] = motor.P_angle.I;
@@ -90,7 +91,7 @@ void mqtt_publish_thread(void *pvParameters)
       serializeJson(doc, buffer, sizeof(buffer));
 
       // Publish the message
-      publishMQTT(buffer); // Use our MQTT publish function
+      publishMQTT(buffer);  // Use our MQTT publish function
     }
     vTaskDelay(interval_ms / portTICK_PERIOD_MS);
   }
@@ -113,39 +114,51 @@ void setup()
   Serial.println(VERSION);
 
   // Initialize WiFi
-  setupWiFi(); // Call our WiFi setup function
+  setupWiFi();  // Call our WiFi setup function
 
   ArduinoOTA.setHostname("wobbler");
-  ArduinoOTA.onStart([]()
-                     {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH) {
-        type = "sketch";
-      } else { // U_SPIFFS
-        type = "filesystem";
-      }
-      Serial.println("Start updating " + type); });
+  ArduinoOTA.onStart(
+      []()
+      {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH)
+        {
+          type = "sketch";
+        }
+        else
+        {  // U_SPIFFS
+          type = "filesystem";
+        }
+        Serial.println("Start updating " + type);
+      });
 
-  ArduinoOTA.onEnd([]()
-                   { Serial.println("\nEnd OTA Update"); });
+  ArduinoOTA.onEnd([]() { Serial.println("\nEnd OTA Update"); });
 
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-                        { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); });
+  ArduinoOTA.onProgress(
+      [](unsigned int progress, unsigned int total)
+      { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); });
 
-  ArduinoOTA.onError([](ota_error_t error)
-                     {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed"); });
+  ArduinoOTA.onError(
+      [](ota_error_t error)
+      {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR)
+          Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR)
+          Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR)
+          Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR)
+          Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR)
+          Serial.println("End Failed");
+      });
 
   ArduinoOTA.begin();
 
   // LED indicator setup
-  pinMode(LED_BUILTIN, OUTPUT); // BLUE LED 44
-  pinMode(43, OUTPUT);          // GREEN LED 43
+  pinMode(LED_BUILTIN, OUTPUT);  // BLUE LED 44
+  pinMode(43, OUTPUT);           // GREEN LED 43
   digitalWrite(43, LOW);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -186,56 +199,49 @@ void setup()
 
   motor.initFOC();
 
-  setupMQTT(); // Call our MQTT setup function
-  xTaskCreatePinnedToCore(
-      mqtt_publish_thread, /* Task function. */
-      "MQTT_Publish",      /* String with name of task. */
-      10000,               /* Stack size in bytes. */
-      NULL,                /* Parameter passed as input of the task */
-      1,                   /* Priority of the task. */
-      &mqtt_publish_task,  /* Task handle. */
-      1);                  /* Core 1 because wifi runs on core 0 */
+  setupMQTT();                                 // Call our MQTT setup function
+  xTaskCreatePinnedToCore(mqtt_publish_thread, /* Task function. */
+                          "MQTT_Publish",      /* String with name of task. */
+                          10000,               /* Stack size in bytes. */
+                          NULL, /* Parameter passed as input of the task */
+                          1,    /* Priority of the task. */
+                          &mqtt_publish_task, /* Task handle. */
+                          1); /* Core 1 because wifi runs on core 0 */
 
   // task for arduinoOTA
-  xTaskCreatePinnedToCore(
-      ota_loop_thread,
-      "OTA_Handler",
-      10000,
-      NULL,
-      1,
-      &arduino_ota_task,
-      1);
+  xTaskCreatePinnedToCore(ota_loop_thread, "OTA_Handler", 10000, NULL, 1,
+                          &arduino_ota_task, 1);
 
   Serial.println("Setup complete.");
 }
 
 void loop()
 {
-  // if commands have changed, disable the motor, update the values, and re-enable the motor
+  // if commands have changed, disable the motor, update the values, and
+  // re-enable the motor
   if (last_commanded_mode != motor.controller)
   {
     motor.disable();
     uint controlmode = (MotionControlType)last_commanded_mode.load();
     switch (controlmode)
     {
-    case 0:
-      motor.controller = MotionControlType::torque;
-      break;
-    case 1:
-      motor.controller = MotionControlType::velocity;
-      break;
-    case 2:
-      motor.controller = MotionControlType::velocity_openloop;
-      break;
-    default:
-      motor.controller = MotionControlType::torque;
-      break;
+      case 0:
+        motor.controller = MotionControlType::torque;
+        break;
+      case 1:
+        motor.controller = MotionControlType::velocity;
+        break;
+      case 2:
+        motor.controller = MotionControlType::velocity_openloop;
+        break;
+      default:
+        motor.controller = MotionControlType::torque;
+        break;
     }
     motor.enable();
   }
 
-  if (
-      (command_vel_p_gain.load() != motor.PID_velocity.P) ||
+  if ((command_vel_p_gain.load() != motor.PID_velocity.P) ||
       (command_vel_i_gain.load() != motor.PID_velocity.I) ||
       (command_vel_d_gain.load() != motor.PID_velocity.D) ||
       (command_vel_lpf.load() != motor.LPF_velocity.Tf) ||
