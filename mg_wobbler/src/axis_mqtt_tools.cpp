@@ -16,6 +16,8 @@ WiFiClient espClient;
 PubSubClient client(espClient);  // Define the client object
 
 // Define the atomic variables (allocate memory for them)
+extern std::atomic<bool> enable_flag;
+extern std::atomic<bool> disable_flag;
 extern std::atomic<float> last_commanded_target;
 extern std::atomic<uint> last_commanded_mode;
 extern std::atomic<float> command_vel_p_gain;
@@ -121,6 +123,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
         if (doc.containsKey("pos_lpf")) {
             command_pos_lpf.store(doc["pos_lpf"].as<float>());
+        }
+        if (doc.containsKey("enable")) {
+            enable_flag.store(doc["enable"].as<bool>());
+        }
+        if (doc.containsKey("disable")) {
+            disable_flag.store(doc["disable"].as<bool>());
         }
     }
 }

@@ -10,7 +10,7 @@
 #include "axis_mqtt_tools.h"    // Include our WiFi header
 #include "axis_wifi_manager.h"  // Include our MQTT header
 #include "pins_arduino.h"       // Include our custom pins for AXIS board
-#define VERSION "1.0.16"        // updated dynamically from python script
+#define VERSION "1.0.30"        // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
