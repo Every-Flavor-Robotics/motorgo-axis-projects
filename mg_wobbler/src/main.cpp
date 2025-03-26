@@ -9,8 +9,9 @@
 
 #include "axis_mqtt_tools.h"    // Include our WiFi header
 #include "axis_wifi_manager.h"  // Include our MQTT header
-#include "pins_arduino.h"       // Include our custom pins for AXIS board
-#define VERSION "1.0.30"        // updated dynamically from python script
+#include "imu.h"
+#include "pins_arduino.h"  // Include our custom pins for AXIS board
+#define VERSION "1.0.45"   // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -31,6 +32,9 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 
 // calibrated sensor object from simplefoc
 CalibratedSensor sensor = CalibratedSensor(encoder0);
+
+// IMU
+Imu::Imu imu;
 
 // global atomic variable for the motor stuff to be set by mqtt
 std::atomic<float> last_commanded_target = 0;
@@ -89,6 +93,10 @@ void mqtt_publish_thread(void *pvParameters)
       doc["pos_i"] = motor.P_angle.I;
       doc["pos_d"] = motor.P_angle.D;
       doc["pos_lpf"] = motor.LPF_angle.Tf;
+      Imu::gravity_vector_t gravity = imu.get_gravity_vector();
+      doc["gravity_x"] = gravity.x;
+      doc["gravity_y"] = gravity.y;
+      doc["gravity_z"] = gravity.z;
 
       // Serialize JSON to string
       char buffer[512];
@@ -124,6 +132,8 @@ void loop_foc_thread(void *pvParameters)
     // loop simplefoc
     motor.move(last_commanded_target.load());
     motor.loopFOC();
+
+    imu.loop();
   }
 }
 
@@ -137,6 +147,9 @@ void setup()
 
   // Initialize WiFi
   setupWiFi();  // Call our WiFi setup function
+
+  // Init and calibrate the IMU
+  imu.init(true);
 
   ArduinoOTA.setHostname("wobbler");
   ArduinoOTA.onStart(
