@@ -7,11 +7,11 @@
 
 #include <atomic>
 
-#include "axis_mqtt_tools.h"    // Include our WiFi header
-#include "axis_wifi_manager.h"  // Include our MQTT header
+#include "axis_mqtt_tools.h"   // Include our WiFi header
+#include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
-#include "pins_arduino.h"  // Include our custom pins for AXIS board
-#define VERSION "1.0.45"   // updated dynamically from python script
+#include "pins_arduino.h" // Include our custom pins for AXIS board
+#define VERSION "1.0.65"  // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -36,40 +36,68 @@ CalibratedSensor sensor = CalibratedSensor(encoder0);
 // IMU
 Imu::Imu imu;
 
-// global atomic variable for the motor stuff to be set by mqtt
-std::atomic<float> last_commanded_target = 0;
-std::atomic<float> command_vel_p_gain = 0;
-std::atomic<float> command_vel_i_gain = 0;
-std::atomic<float> command_vel_d_gain = 0;
-std::atomic<float> command_vel_lpf = 0;
-std::atomic<float> command_pos_p_gain = 0;
-std::atomic<float> command_pos_i_gain = 0;
-std::atomic<float> command_pos_d_gain = 0;
-std::atomic<float> command_pos_lpf = 0;
+// atomic variable to adjust mqtt update frequency
+std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
 
+// global atomic variable for the motor stuff to be set by mqtt
+// target will not be set by us except for debugging
+std::atomic<float> com_motor_torque = 0;
+std::atomic<float> com_balance_pt_rad = 0; // balance point in radians
+std::atomic<float> com_balance_offset_volts = 0; // offset in volts
+std::atomic<float> last_balance_target_volts = 0;
+std::atomic<float> last_offset_volts = 0;
+
+// gains for the inner loop balancing controller
+std::atomic<float> com_bal_p_gain = 0;
+std::atomic<float> com_bal_i_gain = 0;
+std::atomic<float> com_bal_d_gain = 0;
+std::atomic<float> com_vel_lpf = 0;
+
+// flags to flip the x and y dir incase they are wrongly set
+std::atomic<bool> com_x_dir = 0;
+std::atomic<bool> com_y_dir = 0;
+
+// gains for the outer loop correction on the setpoint
+std::atomic<float> com_balance_pt_p_gain = 0;
+std::atomic<float> com_balance_pt_i_gain = 0;
+std::atomic<float> com_balance_pt_d_gain = 0;
+
+// motor control flags
 std::atomic<bool> enable_flag = false;
 std::atomic<bool> disable_flag = false;
 std::atomic<bool> motors_enabled = false;
 
-// 0 for torque, 1 for velocity, 2 for position
-std::atomic<uint> last_commanded_mode = 0;
+// update pid flag
+std::atomic<bool> update_pid_flag = false;
+
+// 0 for disable, 1 for torque foc debug, 2 for balance at given point
+std::atomic<uint8_t> com_mode = 0;
+uint8_t robot_mode = 0;
+
+// balancing PID controller variables ramp and limit are set to max
+// input is IMU and Output is voltage to motor
+PIDController balance_pid = PIDController(0.1, 0.0, 0.0, 8.0, 8.0);
+
+// outer slower loop to correct the setpoint
+// input is the velocity of the motor and output is a small angle correction
+PIDController offset_pt_pid = PIDController(0.0, 0.20, 0.0, 0.0, 0.0);
 
 // make a separate thread for the OTA
 TaskHandle_t loop_foc_task;
 // make a separate thread for the MQTT publishing
 TaskHandle_t mqtt_publish_task;
-const int interval_ms = 500;
 void mqtt_publish_thread(void *pvParameters)
 {
+  int interval_ms = 1000 / mqtt_update_freq_hz.load();
   while (1)
   {
     static unsigned long lastMsg = millis();
     // Handle MQTT connection
     if (!isMQTTConnected())
-    {                   // Use our MQTT connection check function
-      reconnectMQTT();  // Use our MQTT reconnect function
+    {                  // Use our MQTT connection check function
+      reconnectMQTT(); // Use our MQTT reconnect function
     }
-    mqttLoop();  // Handle MQTT client loop (IMPORTANT)
+    mqttLoop(); // Handle MQTT client loop (IMPORTANT)
 
     // Publish data periodically
     if (millis() - lastMsg > interval_ms)
@@ -77,6 +105,10 @@ void mqtt_publish_thread(void *pvParameters)
       // Create JSON document to send data in
       StaticJsonDocument<512> doc;
 
+      //print enabled state
+      doc["enabled"] = motors_enabled.load();
+      // print the control mode
+      doc["mode"] = motor.controller;
       // print target of foc
       doc["target"] = motor.target;
       // print the encoder position
@@ -84,26 +116,32 @@ void mqtt_publish_thread(void *pvParameters)
       // print the encoder velocity
       doc["vel"] = motor.shaft_velocity;
 
-      // print the gains
-      doc["vel_p"] = motor.PID_velocity.P;
-      doc["vel_i"] = motor.PID_velocity.I;
-      doc["vel_d"] = motor.PID_velocity.D;
-      doc["vel_lpf"] = motor.LPF_velocity.Tf;
-      doc["pos_p"] = motor.P_angle.P;
-      doc["pos_i"] = motor.P_angle.I;
-      doc["pos_d"] = motor.P_angle.D;
-      doc["pos_lpf"] = motor.LPF_angle.Tf;
+      // print the IMU data
       Imu::gravity_vector_t gravity = imu.get_gravity_vector();
       doc["gravity_x"] = gravity.x;
       doc["gravity_y"] = gravity.y;
-      doc["gravity_z"] = gravity.z;
+
+      // print balance point in radians
+      float balance_point_rad = com_balance_pt_rad.load();
+      doc["balance_point_rad"] = balance_point_rad;
+      // print the calculated error in radians
+      float error_est = atan2(gravity.y, gravity.x) - balance_point_rad;
+      doc["bp_error_est"] = error_est;
+      
+
+      // print data from the balancing PID
+      float targ_v = last_balance_target_volts.load();
+      float offset_v = last_offset_volts.load();
+      doc["balance_target_volts"] = targ_v;
+      doc["offset_volts"] = offset_v;
+      doc["total_volts"] = targ_v + offset_v;
 
       // Serialize JSON to string
       char buffer[512];
       serializeJson(doc, buffer, sizeof(buffer));
 
       // Publish the message
-      publishMQTT(buffer);  // Use our MQTT publish function
+      publishMQTT(buffer); // Use our MQTT publish function
     }
     vTaskDelay(interval_ms / portTICK_PERIOD_MS);
   }
@@ -130,7 +168,7 @@ void loop_foc_thread(void *pvParameters)
     }
 
     // loop simplefoc
-    motor.move(last_commanded_target.load());
+    motor.move(com_motor_torque.load());
     motor.loopFOC();
 
     imu.loop();
@@ -146,7 +184,7 @@ void setup()
   Serial.println(VERSION);
 
   // Initialize WiFi
-  setupWiFi();  // Call our WiFi setup function
+  setupWiFi(); // Call our WiFi setup function
 
   // Init and calibrate the IMU
   imu.init(true);
@@ -155,29 +193,28 @@ void setup()
   ArduinoOTA.onStart(
       []()
       {
+        // Stop motors on OTA
+        disable_flag.store(true);
+        while(motors_enabled.load())
+        {
+          vTaskDelay(5 / portTICK_PERIOD_MS);
+        }
+
+        // Wait for OTA to start
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH)
         {
           type = "sketch";
         }
         else
-        {  // U_SPIFFS
+        { // U_SPIFFS
           type = "filesystem";
         }
         Serial.println("Start updating " + type);
       });
 
-  ArduinoOTA.onStart(
-      []()
-      {
-        // Stop motors on OTA
-        disable_flag.store(true);
-
-        // Wait to make sure they stop
-        delay(100);
-      });
-
-  ArduinoOTA.onEnd([]() { Serial.println("\nEnd OTA Update"); });
+  ArduinoOTA.onEnd([]()
+                   { Serial.println("\nEnd OTA Update"); });
 
   ArduinoOTA.onProgress(
       [](unsigned int progress, unsigned int total)
@@ -202,8 +239,8 @@ void setup()
   ArduinoOTA.begin();
 
   // LED indicator setup
-  pinMode(LED_BUILTIN, OUTPUT);  // BLUE LED 44
-  pinMode(43, OUTPUT);           // GREEN LED 43
+  pinMode(LED_BUILTIN, OUTPUT); // BLUE LED 44
+  pinMode(43, OUTPUT);          // GREEN LED 43
   digitalWrite(43, LOW);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -224,21 +261,21 @@ void setup()
   motor.voltage_sensor_align = 0.5;
   motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
   motor.torque_controller = TorqueControlType::voltage;
+  motor.controller = MotionControlType::torque;
 
-  // set pid values for velocity controller
-  motor.PID_velocity.P = 0.01;
-  motor.PID_velocity.I = 1;
-  motor.PID_velocity.D = 0;
-  motor.PID_velocity.output_ramp = 1000;
-  motor.PID_velocity.limit = 5000;
-  motor.LPF_velocity.Tf = 0.01;
-  motor.P_angle.P = 10;
-  motor.controller = MotionControlType::velocity;
+  // make sure no other global limits are bothering the system
+  motor.velocity_limit = 50000;
+  motor.current_limit = 100;
+  motor.voltage_limit = 8;
+
+  motor.LPF_velocity.Tf = 0.005;
 
   motor.init();
 
   // align sensor and start FOC
   sensor.voltage_calibration = 0.5;
+
+  // calibrate the sensor and save the alignment
   sensor.calibrate(motor);
   motor.linkSensor(&sensor);
 
@@ -248,10 +285,10 @@ void setup()
   xTaskCreatePinnedToCore(mqtt_publish_thread, /* Task function. */
                           "MQTT_Publish",      /* String with name of task. */
                           10000,               /* Stack size in bytes. */
-                          NULL, /* Parameter passed as input of the task */
-                          1,    /* Priority of the task. */
-                          &mqtt_publish_task, /* Task handle. */
-                          1); /* Core 1 because wifi runs on core 0 */
+                          NULL,                /* Parameter passed as input of the task */
+                          1,                   /* Priority of the task. */
+                          &mqtt_publish_task,  /* Task handle. */
+                          1);                  /* Core 1 because wifi runs on core 0 */
 
   // task for arduinoOTA
   xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
@@ -262,67 +299,95 @@ void setup()
 
 void loop()
 {
-  // if commands have changed, disable the motor, update the values, and
-  // re-enable the motor
-  if (last_commanded_mode.load() != motor.controller)
+  // check if mode has changed and update accordingly
+  uint8_t mode = com_mode.load();
+  if (mode!= robot_mode)
   {
-    disable_flag.store(true);
-    delay(1);
-    while (motors_enabled.load())
+    robot_mode = mode;
+    // jump table for mode differences
+    switch (robot_mode)
     {
-      vTaskDelay(1 / portTICK_PERIOD_MS);
+    case 1:
+      motor.controller = MotionControlType::torque;
+    case 0:
+      disable_flag.store(true);
+      break;
+    case 2:
+    case 3:
+      enable_flag.store(true);
+      motor.controller = MotionControlType::torque;
+      // atan2 of gravity vector is the balance point we want to aim at
+      float x = imu.get_gravity_vector().x;
+      float y = imu.get_gravity_vector().y;
+      if (com_x_dir.load())
+      {
+        x = -x;
+      }
+      if (com_y_dir.load())
+      {
+        y = -y;
+      }
+      float balance_point_rad = atan2(y, x);
+      com_balance_pt_rad.store(balance_point_rad);
+      break;
+    default:
+      disable_flag.store(true);
+      break;
     }
-
-    uint controlmode = (MotionControlType)last_commanded_mode.load();
-    switch (controlmode)
-    {
-      case 0:
-        motor.controller = MotionControlType::torque;
-        break;
-      case 1:
-        motor.controller = MotionControlType::velocity;
-        break;
-      case 2:
-        motor.controller = MotionControlType::velocity_openloop;
-        break;
-      default:
-        motor.controller = MotionControlType::torque;
-        break;
-    }
-    enable_flag.store(true);
   }
 
-  //   if the gains have changed, disable the motor, update the values, and
-  //   re-enable the motor
-  if ((command_vel_p_gain.load() != motor.PID_velocity.P) ||
-      (command_vel_i_gain.load() != motor.PID_velocity.I) ||
-      (command_vel_d_gain.load() != motor.PID_velocity.D) ||
-      (command_vel_lpf.load() != motor.LPF_velocity.Tf) ||
-      (command_pos_p_gain.load() != motor.P_angle.P) ||
-      (command_pos_i_gain.load() != motor.P_angle.I) ||
-      (command_pos_d_gain.load() != motor.P_angle.D) ||
-      (command_pos_lpf.load() != motor.LPF_angle.Tf))
+  // now handle each mode for real
+  switch (robot_mode)
   {
-    disable_flag.store(true);
-    delay(1);
-    while (motors_enabled.load())
-    {
-      vTaskDelay(1 / portTICK_PERIOD_MS);
+  case 1:
+  case 2:
+  case 3:
+    // balance at a given point (our initialized best guess or set by a command)
+    float balance_point_rad = com_balance_pt_rad.load();
+    float offset_volts = 0;
+    // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
+    if (robot_mode == 3) {
+      // calculate the offset based on the outer loop
+      // the offset should aim to reduce the velocity to zero
+      // TODO: we need collect 500ish samples and either LPF or FFT to make sure
+      // we don't add big oscillations to the system
+      offset_volts = offset_pt_pid(motor.shaft_velocity);
     }
+    else {
+      // in debug mode, the offset CAN be set by user - but clamp to max voltage
+      offset_volts = com_balance_offset_volts.load();
+      float max_offset = motor.voltage_limit;
+      offset_volts = constrain(offset_volts, -max_offset, max_offset);
+    }
+    // find error based on gravity vector x and y components and current setpoint
+    // the linear approximation is good enough.  assume small angle approximation
+    float x = imu.get_gravity_vector().x;
+    float y = imu.get_gravity_vector().y;
+    float calculated_error_rad = atan2(y, x) - balance_point_rad;
 
-    motor.PID_velocity.P = command_vel_p_gain.load();
-    motor.PID_velocity.I = command_vel_i_gain.load();
-    motor.PID_velocity.D = command_vel_d_gain.load();
-    motor.LPF_velocity.Tf = command_vel_lpf.load();
-    motor.P_angle.P = command_pos_p_gain.load();
-    motor.P_angle.I = command_pos_i_gain.load();
-    motor.P_angle.D = command_pos_d_gain.load();
-    motor.LPF_angle.Tf = command_pos_lpf.load();
-    enable_flag.store(true);
+    /*  ------------------------------------------------------------------
+     *  get output of balancing pid (volts)
+     *  note that the frequency of calling balance_pid DEFINES the freq of
+     *  the control loop */
+    float balance_target_volts = balance_pid(calculated_error_rad);
+
+    // set motor torque based on both loops
+    motor.target = balance_target_volts + offset_volts;
+
+    // if mode 1, or 2 store data for debugging
+    if (com_mode.load() == 1 || com_mode.load() == 2)
+    {
+      last_balance_target_volts.store(balance_target_volts);
+      last_offset_volts.store(offset_volts);
+    }
+  case 0:
+  default:
+  {
+    // do nothing
   }
-
-  vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 
   //   Handle OTA updates
   ArduinoOTA.handle();
+  vTaskDelay(10 / portTICK_PERIOD_MS);
 }

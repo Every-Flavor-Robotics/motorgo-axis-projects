@@ -16,18 +16,24 @@ WiFiClient espClient;
 PubSubClient client(espClient);  // Define the client object
 
 // Define the atomic variables (allocate memory for them)
+extern std::atomic<uint8_t> mqtt_update_freq_hz;
+extern std::atomic<float> com_motor_torque;
+extern std::atomic<float> com_balance_pt_rad;
+extern std::atomic<float> com_balance_offset_volts;
+extern std::atomic<float> com_bal_p_gain;
+extern std::atomic<float> com_bal_i_gain;
+extern std::atomic<float> com_bal_d_gain;
+extern std::atomic<float> com_vel_lpf;
+extern std::atomic<bool> com_x_dir;
+extern std::atomic<bool> com_y_dir;
+extern std::atomic<float> com_balance_pt_p_gain;
+extern std::atomic<float> com_balance_pt_i_gain;
+extern std::atomic<float> com_balance_pt_d_gain;
 extern std::atomic<bool> enable_flag;
 extern std::atomic<bool> disable_flag;
-extern std::atomic<float> last_commanded_target;
-extern std::atomic<uint> last_commanded_mode;
-extern std::atomic<float> command_vel_p_gain;
-extern std::atomic<float> command_vel_i_gain;
-extern std::atomic<float> command_vel_d_gain;
-extern std::atomic<float> command_vel_lpf;
-extern std::atomic<float> command_pos_p_gain;
-extern std::atomic<float> command_pos_i_gain;
-extern std::atomic<float> command_pos_d_gain;
-extern std::atomic<float> command_pos_lpf;
+extern std::atomic<bool> motors_enabled;
+extern std::atomic<uint8_t> com_mode;
+extern std::atomic<bool> update_pid_flag;
 
 void setupMQTT() {
     client.setServer(mqtt_server, mqtt_port);
@@ -93,43 +99,63 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     else if (strstr(topic, "cmd/") != NULL) {
         StaticJsonDocument<512> doc;
         deserializeJson(doc, message);
-
-        if (doc.containsKey("target")) {
-            last_commanded_target.store(doc["target"].as<float>());
+        
+        if (doc.containsKey("freq")) {
+            mqtt_update_freq_hz.store(doc["freq"]);
         }
         if (doc.containsKey("mode")) {
-            last_commanded_mode.store(doc["mode"].as<uint>());
+            com_mode.store(doc["mode"]);
         }
-        if (doc.containsKey("vel_p")) {
-            command_vel_p_gain.store(doc["vel_p"].as<float>());
+        if (doc.containsKey("torque")) {
+            com_motor_torque.store(doc["torque"]);
         }
-        if (doc.containsKey("vel_i")) {
-            command_vel_i_gain.store(doc["vel_i"].as<float>());
+        if (doc.containsKey("balance_pt_rad")) {
+            com_balance_pt_rad.store(doc["balance_pt_rad"]);
         }
-        if (doc.containsKey("vel_d")) {
-            command_vel_d_gain.store(doc["vel_d"].as<float>());
+        if (doc.containsKey("balance_offset_volts")) {
+            com_balance_offset_volts.store(doc["balance_offset_volts"]);
+        }
+        if (doc.containsKey("bal_p_gain")) {
+            com_bal_p_gain.store(doc["bal_p_gain"]);
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("bal_i_gain")) {
+            com_bal_i_gain.store(doc["bal_i_gain"]);
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("bal_d_gain")) {
+            com_bal_d_gain.store(doc["bal_d_gain"]);
+            update_pid_flag.store(true);
         }
         if (doc.containsKey("vel_lpf")) {
-            command_vel_lpf.store(doc["vel_lpf"].as<float>());
+            com_vel_lpf.store(doc["vel_lpf"]);
+            update_pid_flag.store(true);
         }
-        if (doc.containsKey("pos_p")) {
-            command_pos_p_gain.store(doc["pos_p"].as<float>());
+        if (doc.containsKey("x_dir")) {
+            com_x_dir.store(doc["x_dir"]);
         }
-        if (doc.containsKey("pos_i")) {
-            command_pos_i_gain.store(doc["pos_i"].as<float>());
+        if (doc.containsKey("y_dir")) {
+            com_y_dir.store(doc["y_dir"]);
         }
-        if (doc.containsKey("pos_d")) {
-            command_pos_d_gain.store(doc["pos_d"].as<float>());
+        if (doc.containsKey("balance_pt_p_gain")) {
+            com_balance_pt_p_gain.store(doc["balance_pt_p_gain"]);
+            update_pid_flag.store(true);
         }
-        if (doc.containsKey("pos_lpf")) {
-            command_pos_lpf.store(doc["pos_lpf"].as<float>());
+        if (doc.containsKey("balance_pt_i_gain")) {
+            com_balance_pt_i_gain.store(doc["balance_pt_i_gain"]);
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("balance_pt_d_gain")) {
+            com_balance_pt_d_gain.store(doc["balance_pt_d_gain"]);
+            update_pid_flag.store(true);
         }
         if (doc.containsKey("enable")) {
-            enable_flag.store(doc["enable"].as<bool>());
+            enable_flag.store(doc["enable"]);
         }
         if (doc.containsKey("disable")) {
-            disable_flag.store(doc["disable"].as<bool>());
+            disable_flag.store(doc["disable"]);
         }
+        
     }
 }
 
