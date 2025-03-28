@@ -108,7 +108,7 @@ void mqtt_publish_thread(void *pvParameters)
       //print enabled state
       doc["enabled"] = motors_enabled.load();
       // print the control mode
-      doc["mode"] = motor.controller;
+      doc["mode"] = robot_mode;
       // print target of foc
       doc["target"] = motor.target;
       // print the encoder position
@@ -299,7 +299,7 @@ void setup()
 void loop()
 {
   // TODO: add a maximum allowable balance error to shut off
-  // if past controllable limit
+  // if past controllable
 
   // check if mode has changed and update accordingly
   uint8_t mode = com_mode.load();
