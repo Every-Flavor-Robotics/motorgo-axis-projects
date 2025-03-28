@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.65"  // updated dynamically from python script
+#define VERSION "1.0.71"  // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -127,7 +127,6 @@ void mqtt_publish_thread(void *pvParameters)
       // print the calculated error in radians
       float error_est = atan2(gravity.y, gravity.x) - balance_point_rad;
       doc["bp_error_est"] = error_est;
-      
 
       // print data from the balancing PID
       float targ_v = last_balance_target_volts.load();
@@ -299,9 +298,12 @@ void setup()
 
 void loop()
 {
+  // TODO: add a maximum allowable balance error to shut off
+  // if past controllable limit
+
   // check if mode has changed and update accordingly
   uint8_t mode = com_mode.load();
-  if (mode!= robot_mode)
+  if (mode != robot_mode)
   {
     robot_mode = mode;
     // jump table for mode differences
@@ -314,6 +316,7 @@ void loop()
       break;
     case 2:
     case 3:
+    {
       enable_flag.store(true);
       motor.controller = MotionControlType::torque;
       // atan2 of gravity vector is the balance point we want to aim at
@@ -329,31 +332,35 @@ void loop()
       }
       float balance_point_rad = atan2(y, x);
       com_balance_pt_rad.store(balance_point_rad);
+    }
       break;
     default:
-      disable_flag.store(true);
       break;
     }
   }
 
   // now handle each mode for real
+  // TODO: refactor this
   switch (robot_mode)
   {
-  case 1:
-  case 2:
-  case 3:
+  case 1: // go on to case 2 balancing calc needed, but don't run motors
+  case 2: // go on to case 3 balancing calc needed, run motor, but dont use offset
+  case 3: // perform balancing calc and use motors and offset
+  {
     // balance at a given point (our initialized best guess or set by a command)
     float balance_point_rad = com_balance_pt_rad.load();
     float offset_volts = 0;
     // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
-    if (robot_mode == 3) {
+    if (robot_mode == 3)
+    {
       // calculate the offset based on the outer loop
       // the offset should aim to reduce the velocity to zero
       // TODO: we need collect 500ish samples and either LPF or FFT to make sure
       // we don't add big oscillations to the system
       offset_volts = offset_pt_pid(motor.shaft_velocity);
     }
-    else {
+    else
+    {
       // in debug mode, the offset CAN be set by user - but clamp to max voltage
       offset_volts = com_balance_offset_volts.load();
       float max_offset = motor.voltage_limit;
@@ -380,11 +387,13 @@ void loop()
       last_balance_target_volts.store(balance_target_volts);
       last_offset_volts.store(offset_volts);
     }
-  case 0:
-  default:
-  {
-    // do nothing
   }
+    break;
+  case 0:
+    // do nothing
+    break;
+  default:
+    break;
   }
 
   //   Handle OTA updates
