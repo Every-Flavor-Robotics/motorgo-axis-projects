@@ -52,6 +52,7 @@ class Imu
 {
  public:
   Imu();
+  Imu(float madgwick_gain);
 
   // Init IMU sensor, with default settings. Use saved calibration if available
   void init();

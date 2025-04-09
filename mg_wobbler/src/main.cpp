@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.71"  // updated dynamically from python script
+#define VERSION "1.0.145"  // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -34,7 +34,7 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 CalibratedSensor sensor = CalibratedSensor(encoder0);
 
 // IMU
-Imu::Imu imu;
+Imu::Imu imu(0.2);
 
 // atomic variable to adjust mqtt update frequency
 std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
@@ -43,9 +43,11 @@ std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
 // target will not be set by us except for debugging
 std::atomic<float> com_motor_torque = 0;
 std::atomic<float> com_balance_pt_rad = 0; // balance point in radians
-std::atomic<float> com_balance_offset_volts = 0; // offset in volts
+std::atomic<float> com_balance_offset_rad = 0; // offset in radians
 std::atomic<float> last_balance_target_volts = 0;
-std::atomic<float> last_offset_volts = 0;
+std::atomic<float> last_offset_rad = 0;
+
+std::atomic<float> com_feedforward = 0; // to adjust for non-linearity
 
 // gains for the inner loop balancing controller
 std::atomic<float> com_bal_p_gain = 0;
@@ -61,6 +63,8 @@ std::atomic<bool> com_y_dir = 0;
 std::atomic<float> com_balance_pt_p_gain = 0;
 std::atomic<float> com_balance_pt_i_gain = 0;
 std::atomic<float> com_balance_pt_d_gain = 0;
+std::atomic<float> filtered_velocity_for_outer_loop = 0;
+std::atomic<float> com_outer_vel_lpf_tf = 0.05; // defaulting to 50ms
 
 // motor control flags
 std::atomic<bool> enable_flag = false;
@@ -123,17 +127,19 @@ void mqtt_publish_thread(void *pvParameters)
 
       // print balance point in radians
       float balance_point_rad = com_balance_pt_rad.load();
-      doc["balance_point_rad"] = balance_point_rad;
+      float offset_rad = last_offset_rad.load();
+      doc["bp_offset_rad"] = offset_rad;
+      doc["balance_point_rad"] = balance_point_rad - offset_rad;
       // print the calculated error in radians
       float error_est = atan2(gravity.y, gravity.x) - balance_point_rad;
       doc["bp_error_est"] = error_est;
 
       // print data from the balancing PID
       float targ_v = last_balance_target_volts.load();
-      float offset_v = last_offset_volts.load();
       doc["balance_target_volts"] = targ_v;
-      doc["offset_volts"] = offset_v;
-      doc["total_volts"] = targ_v + offset_v;
+      
+      // outer loop velocity lpf
+      doc["outer_vel"] = filtered_velocity_for_outer_loop.load();
 
       // Serialize JSON to string
       char buffer[512];
@@ -267,9 +273,12 @@ void setup()
   motor.current_limit = 100;
   motor.voltage_limit = 8;
 
-  motor.LPF_velocity.Tf = 0.005;
-
+  motor.LPF_velocity.Tf = 0.005; // 5ms
   motor.init();
+
+  // LPF for outer loop
+  filtered_velocity_for_outer_loop.store(0);
+  com_outer_vel_lpf_tf.store(0.05); // 50ms initial tf
 
   // align sensor and start FOC
   sensor.voltage_calibration = 0.5;
@@ -339,6 +348,19 @@ void loop()
     }
   }
 
+  if (update_pid_flag.load())
+  {
+    balance_pid.P = com_bal_p_gain.load();
+    balance_pid.I = com_bal_i_gain.load();
+    balance_pid.D = com_bal_d_gain.load();
+    motor.LPF_velocity.Tf = com_vel_lpf.load();
+
+    offset_pt_pid.P = com_balance_pt_p_gain.load();
+    offset_pt_pid.I = com_balance_pt_i_gain.load();
+    offset_pt_pid.D = com_balance_pt_d_gain.load();
+    com_outer_vel_lpf_tf.store(com_outer_vel_lpf_tf.load());
+    update_pid_flag.store(false);
+  }
   // now handle each mode for real
   // TODO: refactor this
   switch (robot_mode)
@@ -349,27 +371,40 @@ void loop()
   {
     // balance at a given point (our initialized best guess or set by a command)
     float balance_point_rad = com_balance_pt_rad.load();
-    float offset_volts = 0;
+    float offset_rad = 0;
     // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
+
+    // calculate the offset based on the outer loop
+    // the offset should aim to reduce the velocity to zero
+    float raw_velocity = motor.shaft_velocity;
+    float tf = com_outer_vel_lpf_tf.load();
+    float dt = 0.001; // 5ms  // TODO: make this adjust based on the loop time
+    float alpha = 1.0f; // default for tf is invalid
+    if (tf > 0)
+    {
+      alpha = constrain( (dt / (tf + dt)), 0.0, 1.0 ) ;
+    }
+    float last_vel = filtered_velocity_for_outer_loop.load();
+    filtered_velocity_for_outer_loop.store((1 - alpha) * raw_velocity + alpha * last_vel);
+    offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
     if (robot_mode == 3)
     {
-      // calculate the offset based on the outer loop
-      // the offset should aim to reduce the velocity to zero
-      // TODO: we need collect 500ish samples and either LPF or FFT to make sure
-      // we don't add big oscillations to the system
-      offset_volts = offset_pt_pid(motor.shaft_velocity);
+      // robot mode 3 === FULL ENABLED CONTROL LOOPS - Balance point and offset correction
+      // apply offset
+      balance_point_rad += offset_rad;
     }
     else
     {
-      // in debug mode, the offset CAN be set by user - but clamp to max voltage
-      offset_volts = com_balance_offset_volts.load();
-      float max_offset = motor.voltage_limit;
-      offset_volts = constrain(offset_volts, -max_offset, max_offset);
+      // robot mode 2 === ENABLED CONTROL LOOPS - Balance point only
+      // only apply offset if the user has explicitly set it for debugging - not being calc.
+      offset_rad = com_balance_offset_rad.load();
     }
+
     // find error based on gravity vector x and y components and current setpoint
     // the linear approximation is good enough.  assume small angle approximation
     float x = imu.get_gravity_vector().x;
     float y = imu.get_gravity_vector().y;
+
     float calculated_error_rad = atan2(y, x) - balance_point_rad;
 
     /*  ------------------------------------------------------------------
@@ -379,14 +414,23 @@ void loop()
     float balance_target_volts = balance_pid(calculated_error_rad);
 
     // set motor torque based on both loops
-    motor.target = balance_target_volts + offset_volts;
-
-    // if mode 1, or 2 store data for debugging
-    if (com_mode.load() == 1 || com_mode.load() == 2)
+    // if abs value is within .005 volts, zero out the signal
+    if (abs(balance_target_volts) < 0.015)
     {
-      last_balance_target_volts.store(balance_target_volts);
-      last_offset_volts.store(offset_volts);
+      balance_target_volts = 0;
     }
+    else
+    {
+      float ff = com_feedforward.load();
+      balance_target_volts += (balance_target_volts > 0) ? ff : -(ff);
+    }
+
+    // set the motor torque
+    com_motor_torque.store(balance_target_volts);
+
+    // store the last values for debugging
+    last_balance_target_volts.store(balance_target_volts);
+    last_offset_rad.store(offset_rad);
   }
     break;
   case 0:
@@ -398,5 +442,7 @@ void loop()
 
   //   Handle OTA updates
   ArduinoOTA.handle();
-  vTaskDelay(10 / portTICK_PERIOD_MS);
+ 
+  // delay task for 1 ms
+  vTaskDelay(1 / portTICK_PERIOD_MS);
 }

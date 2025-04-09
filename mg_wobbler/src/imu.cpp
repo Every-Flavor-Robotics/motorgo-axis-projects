@@ -113,6 +113,8 @@ imu_calibration_data_t read_calibration_data(const char* name)
 
 Imu::Imu() {}
 
+Imu::Imu(float madgwick_gain) : filter(madgwick_gain){}
+
 void Imu::init(bool should_calibrate)
 {
   if (!imu_initialized)

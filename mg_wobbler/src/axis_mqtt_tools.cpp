@@ -19,7 +19,8 @@ PubSubClient client(espClient);  // Define the client object
 extern std::atomic<uint8_t> mqtt_update_freq_hz;
 extern std::atomic<float> com_motor_torque;
 extern std::atomic<float> com_balance_pt_rad;
-extern std::atomic<float> com_balance_offset_volts;
+extern std::atomic<float> com_balance_offset_rad;
+extern std::atomic<float> com_feedforward;
 extern std::atomic<float> com_bal_p_gain;
 extern std::atomic<float> com_bal_i_gain;
 extern std::atomic<float> com_bal_d_gain;
@@ -29,6 +30,7 @@ extern std::atomic<bool> com_y_dir;
 extern std::atomic<float> com_balance_pt_p_gain;
 extern std::atomic<float> com_balance_pt_i_gain;
 extern std::atomic<float> com_balance_pt_d_gain;
+extern std::atomic<float> com_outer_vel_lpf_tf;
 extern std::atomic<bool> enable_flag;
 extern std::atomic<bool> disable_flag;
 extern std::atomic<bool> motors_enabled;
@@ -113,7 +115,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             com_balance_pt_rad.store(doc["balance_pt_rad"].as<float>());
         }
         if (doc.containsKey("balance_offset_volts")) {
-            com_balance_offset_volts.store(doc["balance_offset_volts"].as<float>());
+            com_balance_offset_rad.store(doc["balance_offset_rad"].as<float>());
+        }
+        if (doc.containsKey("feedforward")) {
+            com_feedforward.store(doc["feedforward"].as<float>());
         }
         if (doc.containsKey("bal_p_gain")) {
             com_bal_p_gain.store(doc["bal_p_gain"].as<float>());
@@ -147,6 +152,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
         if (doc.containsKey("balance_pt_d_gain")) {
             com_balance_pt_d_gain.store(doc["balance_pt_d_gain"].as<float>());
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("outer_vel_lpf_tf")) {
+            com_outer_vel_lpf_tf.store(doc["outer_vel_lpf_tf"].as<float>());
             update_pid_flag.store(true);
         }
         if (doc.containsKey("enable")) {
