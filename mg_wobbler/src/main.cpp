@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.145"  // updated dynamically from python script
+#define VERSION "1.0.212" // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -34,36 +34,40 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 CalibratedSensor sensor = CalibratedSensor(encoder0);
 
 // IMU
-Imu::Imu imu(0.2);
+Imu::Imu imu(0.35);
 
 // atomic variable to adjust mqtt update frequency
 std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
 
+std::atomic<float> com_vel_p = 0.5;
+std::atomic<float> com_vel_i = 0.0;
+std::atomic<float> com_vel_d = 0.0;
+std::atomic<float> com_vel_lpf = 0.003;
+std::atomic<float> last_commanded_vel_rads = 0.0;
+std::atomic<float> com_feedforward_velocity = 0.0; // default to 10 rad/s
+std::atomic<float> com_target_debug = 0.0; // target for debugging
+
 // global atomic variable for the motor stuff to be set by mqtt
 // target will not be set by us except for debugging
-std::atomic<float> com_motor_torque = 0;
-std::atomic<float> com_balance_pt_rad = 0; // balance point in radians
-std::atomic<float> com_balance_offset_rad = 0; // offset in radians
-std::atomic<float> last_balance_target_volts = 0;
-std::atomic<float> last_offset_rad = 0;
-
-std::atomic<float> com_feedforward = 0; // to adjust for non-linearity
+std::atomic<float> com_balance_pt_rad = 0.0;     // balance point in radians
+std::atomic<float> com_balance_offset_rad = 0.0; // offset in radians
+std::atomic<float> last_balance_target_delta_rads = 0.0;
+std::atomic<float> last_offset_rad = 0.0;
 
 // gains for the inner loop balancing controller
-std::atomic<float> com_bal_p_gain = 0;
-std::atomic<float> com_bal_i_gain = 0;
-std::atomic<float> com_bal_d_gain = 0;
-std::atomic<float> com_vel_lpf = 0;
+std::atomic<float> com_bal_p_gain = 0.0;
+std::atomic<float> com_bal_i_gain = 0.0;
+std::atomic<float> com_bal_d_gain = 0.0;
 
 // flags to flip the x and y dir incase they are wrongly set
 std::atomic<bool> com_x_dir = 0;
 std::atomic<bool> com_y_dir = 0;
 
 // gains for the outer loop correction on the setpoint
-std::atomic<float> com_balance_pt_p_gain = 0;
-std::atomic<float> com_balance_pt_i_gain = 0;
-std::atomic<float> com_balance_pt_d_gain = 0;
-std::atomic<float> filtered_velocity_for_outer_loop = 0;
+std::atomic<float> com_balance_pt_p_gain = 0.0;
+std::atomic<float> com_balance_pt_i_gain = 0.0;
+std::atomic<float> com_balance_pt_d_gain = 0.0;
+std::atomic<float> filtered_velocity_for_outer_loop = 0.0;
 std::atomic<float> com_outer_vel_lpf_tf = 0.05; // defaulting to 50ms
 
 // motor control flags
@@ -80,11 +84,13 @@ uint8_t robot_mode = 0;
 
 // balancing PID controller variables ramp and limit are set to max
 // input is IMU and Output is voltage to motor
-PIDController balance_pid = PIDController(0.1, 0.0, 0.0, 8.0, 8.0);
+float delta_v_ramp_lim = 100.0; // 50 rad/s per timestep
+float max_pid_output = 100.0; // 100 rad/s max output
+PIDController balance_pid = PIDController(0.0, 0.0, 0.0, delta_v_ramp_lim, max_pid_output);
 
 // outer slower loop to correct the setpoint
 // input is the velocity of the motor and output is a small angle correction
-PIDController offset_pt_pid = PIDController(0.0, 0.20, 0.0, 0.0, 0.0);
+PIDController offset_pt_pid = PIDController(0.0, 0.00, 0.0, 1.0, 1.0);
 
 // make a separate thread for the OTA
 TaskHandle_t loop_foc_task;
@@ -109,7 +115,7 @@ void mqtt_publish_thread(void *pvParameters)
       // Create JSON document to send data in
       StaticJsonDocument<512> doc;
 
-      //print enabled state
+      // print enabled state
       doc["enabled"] = motors_enabled.load();
       // print the control mode
       doc["mode"] = robot_mode;
@@ -135,9 +141,9 @@ void mqtt_publish_thread(void *pvParameters)
       doc["bp_error_est"] = error_est;
 
       // print data from the balancing PID
-      float targ_v = last_balance_target_volts.load();
+      float targ_v = last_balance_target_delta_rads.load();
       doc["balance_target_volts"] = targ_v;
-      
+
       // outer loop velocity lpf
       doc["outer_vel"] = filtered_velocity_for_outer_loop.load();
 
@@ -173,7 +179,15 @@ void loop_foc_thread(void *pvParameters)
     }
 
     // loop simplefoc
-    motor.move(com_motor_torque.load());
+    // if the last_commanded_vel abs is less than the abs of the feedforward,
+    // set the target to the feedforward
+    float feedforward = com_feedforward_velocity.load();
+    float vel = last_commanded_vel_rads.load();
+    if (abs(vel) < abs(feedforward) && vel != 0.0)
+    {
+      vel = (vel/abs(vel)) * feedforward;
+    }
+    motor.move(vel); // set the target velocity to the motor
     motor.loopFOC();
 
     imu.loop();
@@ -200,7 +214,7 @@ void setup()
       {
         // Stop motors on OTA
         disable_flag.store(true);
-        while(motors_enabled.load())
+        while (motors_enabled.load())
         {
           vTaskDelay(5 / portTICK_PERIOD_MS);
         }
@@ -263,17 +277,21 @@ void setup()
 
   // link motor to driver and set up
   motor.linkDriver(&driver);
-  motor.voltage_sensor_align = 0.5;
-  motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+  motor.voltage_sensor_align = 0.35;
+  motor.foc_modulation = FOCModulationType::Trapezoid_150;
   motor.torque_controller = TorqueControlType::voltage;
-  motor.controller = MotionControlType::torque;
+  motor.controller = MotionControlType::velocity;
 
   // make sure no other global limits are bothering the system
-  motor.velocity_limit = 50000;
-  motor.current_limit = 100;
+  motor.velocity_limit = 1000;
+  motor.current_limit = 10.0;
   motor.voltage_limit = 8;
 
-  motor.LPF_velocity.Tf = 0.005; // 5ms
+  motor.PID_velocity.P = 0.5;
+  motor.PID_velocity.I = 0.0;
+  motor.PID_velocity.D = 0.0;
+
+  motor.LPF_velocity.Tf = 0.003; // 1ms
   motor.init();
 
   // LPF for outer loop
@@ -298,10 +316,13 @@ void setup()
                           &mqtt_publish_task,  /* Task handle. */
                           1);                  /* Core 1 because wifi runs on core 0 */
 
-  // task for arduinoOTA
+  // task for motor controls
   xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
                           &loop_foc_task, 1);
 
+  // start the motor disabled
+  motor.disable();
+  motors_enabled.store(false);
   Serial.println("Setup complete.");
 }
 
@@ -319,15 +340,31 @@ void loop()
     switch (robot_mode)
     {
     case 1:
-      motor.controller = MotionControlType::torque;
     case 0:
+      motor.controller = MotionControlType::velocity;
+      // set targets to 0
+      last_commanded_vel_rads.store(0.0);
+      com_balance_pt_rad.store(0.0);
+      com_balance_offset_rad.store(0.0);
+      // clear pid
+      motor.PID_velocity.reset();
+      balance_pid.reset();
+      offset_pt_pid.reset();
       disable_flag.store(true);
       break;
     case 2:
     case 3:
     {
+      // set targets to 0
+      last_commanded_vel_rads.store(0.0);
+      com_balance_pt_rad.store(0.0);
+      com_balance_offset_rad.store(0.0);
+      // clear pid
+      motor.PID_velocity.reset();
+      balance_pid.reset();
+      offset_pt_pid.reset();
       enable_flag.store(true);
-      motor.controller = MotionControlType::torque;
+      motor.controller = MotionControlType::velocity;
       // atan2 of gravity vector is the balance point we want to aim at
       float x = imu.get_gravity_vector().x;
       float y = imu.get_gravity_vector().y;
@@ -342,7 +379,7 @@ void loop()
       float balance_point_rad = atan2(y, x);
       com_balance_pt_rad.store(balance_point_rad);
     }
-      break;
+    break;
     default:
       break;
     }
@@ -350,99 +387,94 @@ void loop()
 
   if (update_pid_flag.load())
   {
+    // motor velocity pid gains
+    motor.PID_velocity.P = com_vel_p.load();
+    motor.PID_velocity.I = com_vel_i.load();
+    motor.PID_velocity.D = com_vel_d.load();
+    motor.LPF_velocity.Tf = com_vel_lpf.load();
+
+    // balancing pid gains
     balance_pid.P = com_bal_p_gain.load();
     balance_pid.I = com_bal_i_gain.load();
     balance_pid.D = com_bal_d_gain.load();
-    motor.LPF_velocity.Tf = com_vel_lpf.load();
 
     offset_pt_pid.P = com_balance_pt_p_gain.load();
     offset_pt_pid.I = com_balance_pt_i_gain.load();
     offset_pt_pid.D = com_balance_pt_d_gain.load();
-    com_outer_vel_lpf_tf.store(com_outer_vel_lpf_tf.load());
+
+    // clear the pids
+    motor.PID_velocity.reset();
+    balance_pid.reset();
+    offset_pt_pid.reset();
     update_pid_flag.store(false);
   }
   // now handle each mode for real
-  // TODO: refactor this
-  switch (robot_mode)
+  // balance at a given point (our initialized best guess or set by a command)
+  float balance_point_rad = com_balance_pt_rad.load();
+  float offset_rad = com_balance_offset_rad.load();
+  // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
+  // calculate the offset based on the outer loop
+  // the offset should aim to reduce the velocity to zero
+  float raw_velocity = motor.shaft_velocity;
+  float tf = com_outer_vel_lpf_tf.load();
+  float dt = 0.000100;   // 100us  // TODO: make this adjust based on the loop time
+  float alpha = 1.0f; // default for if tf is invalid
+  if (tf > 0)
   {
-  case 1: // go on to case 2 balancing calc needed, but don't run motors
-  case 2: // go on to case 3 balancing calc needed, run motor, but dont use offset
-  case 3: // perform balancing calc and use motors and offset
-  {
-    // balance at a given point (our initialized best guess or set by a command)
-    float balance_point_rad = com_balance_pt_rad.load();
-    float offset_rad = 0;
-    // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
-
-    // calculate the offset based on the outer loop
-    // the offset should aim to reduce the velocity to zero
-    float raw_velocity = motor.shaft_velocity;
-    float tf = com_outer_vel_lpf_tf.load();
-    float dt = 0.001; // 5ms  // TODO: make this adjust based on the loop time
-    float alpha = 1.0f; // default for tf is invalid
-    if (tf > 0)
-    {
-      alpha = constrain( (dt / (tf + dt)), 0.0, 1.0 ) ;
-    }
-    float last_vel = filtered_velocity_for_outer_loop.load();
-    filtered_velocity_for_outer_loop.store((1 - alpha) * raw_velocity + alpha * last_vel);
-    offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
-    if (robot_mode == 3)
-    {
-      // robot mode 3 === FULL ENABLED CONTROL LOOPS - Balance point and offset correction
-      // apply offset
-      balance_point_rad += offset_rad;
-    }
-    else
-    {
-      // robot mode 2 === ENABLED CONTROL LOOPS - Balance point only
-      // only apply offset if the user has explicitly set it for debugging - not being calc.
-      offset_rad = com_balance_offset_rad.load();
-    }
-
-    // find error based on gravity vector x and y components and current setpoint
-    // the linear approximation is good enough.  assume small angle approximation
-    float x = imu.get_gravity_vector().x;
-    float y = imu.get_gravity_vector().y;
-
-    float calculated_error_rad = atan2(y, x) - balance_point_rad;
-
-    /*  ------------------------------------------------------------------
-     *  get output of balancing pid (volts)
-     *  note that the frequency of calling balance_pid DEFINES the freq of
-     *  the control loop */
-    float balance_target_volts = balance_pid(calculated_error_rad);
-
-    // set motor torque based on both loops
-    // if abs value is within .005 volts, zero out the signal
-    if (abs(balance_target_volts) < 0.015)
-    {
-      balance_target_volts = 0;
-    }
-    else
-    {
-      float ff = com_feedforward.load();
-      balance_target_volts += (balance_target_volts > 0) ? ff : -(ff);
-    }
-
-    // set the motor torque
-    com_motor_torque.store(balance_target_volts);
-
-    // store the last values for debugging
-    last_balance_target_volts.store(balance_target_volts);
-    last_offset_rad.store(offset_rad);
+    alpha = constrain((dt / (tf + dt)), 0.0, 1.0);
   }
-    break;
-  case 0:
-    // do nothing
-    break;
-  default:
-    break;
+  float last_vel = filtered_velocity_for_outer_loop.load();
+  filtered_velocity_for_outer_loop.store((1 - alpha) * raw_velocity + alpha * last_vel);
+
+  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
+
+  // in mode 2, overwrite the offset with the commanded offset
+  if (mode == 2) {
+    offset_rad = com_balance_offset_rad.load();
+  } 
+
+  // add the offset to the balance point
+  balance_point_rad += offset_rad;
+
+  // find error based on gravity vector x and y components and current setpoint
+  // the linear approximation is good enough.  assume small angle approximation
+  float x = imu.get_gravity_vector().x;
+  float y = imu.get_gravity_vector().y;
+
+  float calculated_error_rad = atan2(y, x) - balance_point_rad;
+
+  /*  ------------------------------------------------------------------
+   *  get output of balancing pid (delta velocity == delta rad/s)
+   *  note that the frequency of calling balance_pid DEFINES the freq of
+   *  the control loop */
+  float balance_target_delta_rads = balance_pid(calculated_error_rad);
+  
+  // finally, if the output is too large, set it to the max
+  balance_target_delta_rads = constrain(balance_target_delta_rads, -100.0, 100.0);
+
+  // add the delta V to the current velocity to get the new velocity
+  float new_target_vel = (last_commanded_vel_rads.load() + balance_target_delta_rads);
+
+  // set the motor commands with our calculated new target unless we are in mode 1
+  // in which just pass the debug target to the velocity controller
+  if (robot_mode == 1){
+    last_commanded_vel_rads.store(com_target_debug.load());
   }
+  else if (robot_mode == 0){
+    //do nothing
+  }
+  else if (robot_mode == 2 || robot_mode == 3){
+    constrain(new_target_vel, -motor.velocity_limit, motor.velocity_limit);
+    last_commanded_vel_rads.store(new_target_vel);
+  }
+
+  // store the last values for debugging and logging
+  last_balance_target_delta_rads.store(balance_target_delta_rads);
+  last_offset_rad.store(offset_rad);
 
   //   Handle OTA updates
   ArduinoOTA.handle();
- 
+
   // delay task for 1 ms
-  vTaskDelay(1 / portTICK_PERIOD_MS);
+  delayMicroseconds(100);
 }

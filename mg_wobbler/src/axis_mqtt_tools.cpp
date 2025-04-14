@@ -17,10 +17,13 @@ PubSubClient client(espClient);  // Define the client object
 
 // Define the atomic variables (allocate memory for them)
 extern std::atomic<uint8_t> mqtt_update_freq_hz;
-extern std::atomic<float> com_motor_torque;
+extern std::atomic<float> com_vel_p;
+extern std::atomic<float> com_vel_i;
+extern std::atomic<float> com_vel_d;
+extern std::atomic<float> com_feedforward_velocity;
+extern std::atomic<float> com_target_debug;
 extern std::atomic<float> com_balance_pt_rad;
 extern std::atomic<float> com_balance_offset_rad;
-extern std::atomic<float> com_feedforward;
 extern std::atomic<float> com_bal_p_gain;
 extern std::atomic<float> com_bal_i_gain;
 extern std::atomic<float> com_bal_d_gain;
@@ -105,20 +108,33 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         if (doc.containsKey("freq")) {
             mqtt_update_freq_hz.store(doc["freq"].as<float>());
         }
+        if (doc.containsKey("vel_p")) {
+            com_vel_p.store(doc["vel_p"].as<float>());
+            update_pid_flag.store(true);
+            
+        }
+        if (doc.containsKey("vel_i")) {
+            com_vel_i.store(doc["vel_i"].as<float>());
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("vel_d")) {
+            com_vel_d.store(doc["vel_d"].as<float>());
+            update_pid_flag.store(true);
+        }
+        if (doc.containsKey("feedforward")) {
+            com_feedforward_velocity.store(doc["feedforward"].as<float>());
+        }
+        if (doc.containsKey("target")) {
+            com_target_debug.store(doc["target"].as<float>());
+        }
         if (doc.containsKey("mode")) {
             com_mode.store(doc["mode"].as<uint8_t>());
-        }
-        if (doc.containsKey("torque")) {
-            com_motor_torque.store(doc["torque"].as<float>());
         }
         if (doc.containsKey("balance_pt_rad")) {
             com_balance_pt_rad.store(doc["balance_pt_rad"].as<float>());
         }
         if (doc.containsKey("balance_offset_volts")) {
             com_balance_offset_rad.store(doc["balance_offset_rad"].as<float>());
-        }
-        if (doc.containsKey("feedforward")) {
-            com_feedforward.store(doc["feedforward"].as<float>());
         }
         if (doc.containsKey("bal_p_gain")) {
             com_bal_p_gain.store(doc["bal_p_gain"].as<float>());
