@@ -5,7 +5,7 @@
 
 // IMU includes
 #include <Adafruit_AHRS.h>
-#include <Adafruit_LSM6DS33.h>
+#include <Adafruit_LSM6DSOX.h>
 #include <Arduino.h>
 #include <Preferences.h>
 #include <Wire.h>
@@ -45,7 +45,7 @@ typedef union
 //                                    sensors_event_t &gyro_event,
 //                                    sensors_event_t &mag_event);
 
-extern Adafruit_LSM6DS33 lsm6ds;
+extern Adafruit_LSM6DSOX lsm6ds;
 // extern Adafruit_LIS3MDL lis3mdl;
 
 class Imu

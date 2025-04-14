@@ -4,7 +4,7 @@ namespace Imu
 {
 
 bool imu_initialized = false;
-Adafruit_LSM6DS33 lsm6ds;
+Adafruit_LSM6DSOX lsm6ds;
 // Adafruit_LIS3MDL lis3mdl;
 
 // uint16_t crc16_update(uint16_t crc, uint8_t a)
@@ -120,17 +120,17 @@ void Imu::init(bool should_calibrate)
   if (!imu_initialized)
   {
     // Start I2C bus
-    Wire1.begin(HIDDEN_SDA, HIDDEN_SCL, 400000);
+    Wire1.begin(SDA, SCL, 400000);
     bool lsm6ds_success = lsm6ds.begin_I2C(0x6a, &Wire1);
     // bool lis3mdl_success = lis3mdl.begin_I2C(0x1C, &Wire1);
 
     imu_initialized = true;
   }
 
-  lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_16_G);
-  lsm6ds.setAccelDataRate(LSM6DS_RATE_416_HZ);
-  lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS);
-  lsm6ds.setGyroDataRate(LSM6DS_RATE_416_HZ);
+  lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
+  lsm6ds.setAccelDataRate(LSM6DS_RATE_1_66K_HZ);
+  lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS);
+  lsm6ds.setGyroDataRate(LSM6DS_RATE_1_66K_HZ);
 
   //   lis3mdl.setPerformanceMode(LIS3MDL_ULTRAHIGHMODE);
   //   lis3mdl.setOperationMode(LIS3MDL_CONTINUOUSMODE);
