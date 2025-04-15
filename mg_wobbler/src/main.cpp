@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.212" // updated dynamically from python script
+#define VERSION "1.0.216" // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -278,7 +278,7 @@ void setup()
   // link motor to driver and set up
   motor.linkDriver(&driver);
   motor.voltage_sensor_align = 0.35;
-  motor.foc_modulation = FOCModulationType::Trapezoid_150;
+  motor.foc_modulation = FOCModulationType::SinePWM;
   motor.torque_controller = TorqueControlType::voltage;
   motor.controller = MotionControlType::velocity;
 
@@ -450,7 +450,7 @@ void loop()
   float balance_target_delta_rads = balance_pid(calculated_error_rad);
   
   // finally, if the output is too large, set it to the max
-  balance_target_delta_rads = constrain(balance_target_delta_rads, -100.0, 100.0);
+  balance_target_delta_rads = constrain(balance_target_delta_rads, -30.0, 30.0);
 
   // add the delta V to the current velocity to get the new velocity
   float new_target_vel = (last_commanded_vel_rads.load() + balance_target_delta_rads);
