@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.216" // updated dynamically from python script
+#define VERSION "1.0.289" // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -34,10 +34,14 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 CalibratedSensor sensor = CalibratedSensor(encoder0);
 
 // IMU
-Imu::Imu imu(0.35);
+Imu::Imu imu(1);
 
 // atomic variable to adjust mqtt update frequency
 std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
+std::atomic<u_long> time_checker_imu = 0; // for checking the time in the imu.loop()
+std::atomic<u_long> time_checker_foc = 0; // for checking the time in the foc loop
+unsigned long last_time_foc = 0; // for checking the time in the loops
+unsigned long last_time_imu = 0; // for checking the time in the imu loop
 
 std::atomic<float> com_vel_p = 0.5;
 std::atomic<float> com_vel_i = 0.0;
@@ -90,10 +94,11 @@ PIDController balance_pid = PIDController(0.0, 0.0, 0.0, delta_v_ramp_lim, max_p
 
 // outer slower loop to correct the setpoint
 // input is the velocity of the motor and output is a small angle correction
-PIDController offset_pt_pid = PIDController(0.0, 0.00, 0.0, 1.0, 1.0);
+PIDController offset_pt_pid = PIDController(0.0, 0.0, 0.0, 1.0, 1.0);
 
 // make a separate thread for the OTA
-TaskHandle_t loop_foc_task;
+// TaskHandle_t loop_foc_task;
+esp_timer_handle_t foc_timer;
 // make a separate thread for the MQTT publishing
 TaskHandle_t mqtt_publish_task;
 void mqtt_publish_thread(void *pvParameters)
@@ -146,6 +151,10 @@ void mqtt_publish_thread(void *pvParameters)
 
       // outer loop velocity lpf
       doc["outer_vel"] = filtered_velocity_for_outer_loop.load();
+      
+      // print time of control loop
+      doc["imu_time"] = time_checker_imu.load();
+      doc["foc_time"] = time_checker_foc.load();
 
       // Serialize JSON to string
       char buffer[512];
@@ -190,7 +199,12 @@ void loop_foc_thread(void *pvParameters)
     motor.move(vel); // set the target velocity to the motor
     motor.loopFOC();
 
-    imu.loop();
+    // start timer for loop in microseconds
+    unsigned long now_time = micros();
+    // find elapsed time
+    unsigned long elapsed_time = now_time - last_time_foc;
+    last_time_foc = now_time;
+    time_checker_foc.store(elapsed_time);
   }
 }
 
@@ -271,27 +285,27 @@ void setup()
   motor.linkSensor(&sensor);
 
   // motor driver setup
-  driver.voltage_power_supply = 8;
-  driver.voltage_limit = 8;
+  driver.voltage_power_supply = 15;
+  driver.voltage_limit = 15;
   driver.init();
 
   // link motor to driver and set up
   motor.linkDriver(&driver);
-  motor.voltage_sensor_align = 0.35;
+  motor.voltage_sensor_align = 1.0;
   motor.foc_modulation = FOCModulationType::SinePWM;
   motor.torque_controller = TorqueControlType::voltage;
   motor.controller = MotionControlType::velocity;
 
   // make sure no other global limits are bothering the system
   motor.velocity_limit = 1000;
-  motor.current_limit = 10.0;
-  motor.voltage_limit = 8;
+  motor.current_limit = 15.0;
+  motor.voltage_limit = 15.0;
 
-  motor.PID_velocity.P = 0.5;
+  motor.PID_velocity.P = 1.25;
   motor.PID_velocity.I = 0.0;
-  motor.PID_velocity.D = 0.0;
+  motor.PID_velocity.D = 0.005;
 
-  motor.LPF_velocity.Tf = 0.003; // 1ms
+  motor.LPF_velocity.Tf = 0.003;
   motor.init();
 
   // LPF for outer loop
@@ -299,7 +313,7 @@ void setup()
   com_outer_vel_lpf_tf.store(0.05); // 50ms initial tf
 
   // align sensor and start FOC
-  sensor.voltage_calibration = 0.5;
+  sensor.voltage_calibration = 1.0;
 
   // calibrate the sensor and save the alignment
   sensor.calibrate(motor);
@@ -314,16 +328,37 @@ void setup()
                           NULL,                /* Parameter passed as input of the task */
                           1,                   /* Priority of the task. */
                           &mqtt_publish_task,  /* Task handle. */
-                          1);                  /* Core 1 because wifi runs on core 0 */
+                          0);                  /* Core 1 because wifi runs on core 0 */
 
   // task for motor controls
-  xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
-                          &loop_foc_task, 1);
+  // creeate periodic task for foc loop using esp high resolution timer
+  esp_timer_create_args_t foc_timer_args;
+  foc_timer_args.callback = loop_foc_thread;
+  foc_timer_args.arg = NULL;
+  foc_timer_args.name = "foc_timer";
+  foc_timer_args.dispatch_method = ESP_TIMER_TASK;
+  foc_timer_args.skip_unhandled_events = false;
+  
+  esp_err_t err = esp_timer_create(&foc_timer_args, &foc_timer);
+  if (err != ESP_OK)
+  {
+    Serial.println("Failed to create timer");
+  }
+  else
+  {
+    esp_timer_start_periodic(foc_timer, 50);
+    Serial.println("Timer started");
+  }
+
+  // xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
+  //                         &loop_foc_task, 1);
 
   // start the motor disabled
   motor.disable();
   motors_enabled.store(false);
   Serial.println("Setup complete.");
+  last_time_imu = micros();
+  last_time_foc = micros();
 }
 
 void loop()
@@ -411,6 +446,8 @@ void loop()
   // now handle each mode for real
   // balance at a given point (our initialized best guess or set by a command)
   float balance_point_rad = com_balance_pt_rad.load();
+  float max_balance_point = balance_point_rad + _PI_6;
+  float min_balance_point = balance_point_rad - _PI_6;
   float offset_rad = com_balance_offset_rad.load();
   // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
   // calculate the offset based on the outer loop
@@ -426,7 +463,7 @@ void loop()
   float last_vel = filtered_velocity_for_outer_loop.load();
   filtered_velocity_for_outer_loop.store((1 - alpha) * raw_velocity + alpha * last_vel);
 
-  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
+  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop - 10.0f);
 
   // in mode 2, overwrite the offset with the commanded offset
   if (mode == 2) {
@@ -434,7 +471,7 @@ void loop()
   } 
 
   // add the offset to the balance point
-  balance_point_rad += offset_rad;
+  balance_point_rad = constrain((balance_point_rad + offset_rad), min_balance_point, max_balance_point);
 
   // find error based on gravity vector x and y components and current setpoint
   // the linear approximation is good enough.  assume small angle approximation
@@ -450,10 +487,10 @@ void loop()
   float balance_target_delta_rads = balance_pid(calculated_error_rad);
   
   // finally, if the output is too large, set it to the max
-  balance_target_delta_rads = constrain(balance_target_delta_rads, -30.0, 30.0);
+  balance_target_delta_rads = constrain(balance_target_delta_rads, -100.0, 100.0);
 
   // add the delta V to the current velocity to get the new velocity
-  float new_target_vel = (last_commanded_vel_rads.load() + balance_target_delta_rads);
+  float new_target_vel = (motor.shaft_velocity + balance_target_delta_rads);
 
   // set the motor commands with our calculated new target unless we are in mode 1
   // in which just pass the debug target to the velocity controller
@@ -475,6 +512,11 @@ void loop()
   //   Handle OTA updates
   ArduinoOTA.handle();
 
-  // delay task for 1 ms
-  delayMicroseconds(100);
+  // normally delay the task, but since imu takes so dang long, just assume 2ms ish delay
+  imu.loop();
+
+  unsigned long now_time = micros();
+  unsigned long elapsed_time = now_time - last_time_imu;
+  last_time_imu = now_time;
+  time_checker_imu.store(elapsed_time);
 }

@@ -5,10 +5,11 @@
 
 // IMU includes
 #include <Adafruit_AHRS.h>
-#include <Adafruit_LSM6DSOX.h>
+#include <Adafruit_LSM6DS33.h>
 #include <Arduino.h>
 #include <Preferences.h>
 #include <Wire.h>
+
 
 // Open imu namespace
 namespace Imu
@@ -45,9 +46,8 @@ typedef union
 //                                    sensors_event_t &gyro_event,
 //                                    sensors_event_t &mag_event);
 
-extern Adafruit_LSM6DSOX lsm6ds;
+extern Adafruit_LSM6DS33 lsm6ds;
 // extern Adafruit_LIS3MDL lis3mdl;
-
 class Imu
 {
  public:
@@ -91,15 +91,22 @@ class Imu
   byte calcount = 0;
   imu_calibration_data_t calibration_data;
 
+
+
   // Filter
   Adafruit_Madgwick filter;
   // Last filter update time
   unsigned long last_update;
 
   // Event objects to store IMU data
-  //   sensors_event_t accel_event, gyro_event, mag_event, temp;
+  // sensors_event_t accel_event, gyro_event, mag_event, temp;
   sensors_event_t accel_event, gyro_event, temp;
   float low_pass_pitch_rate = 0.0f;
+
+  const int imu_copi = 13;
+  const int imu_cipo = 37;
+  const int imu_sck = 14;
+  const int imu_cs = 39;
 
   // Function for reading IMU data
   void read();
