@@ -5,7 +5,8 @@
 
 // IMU includes
 #include <Adafruit_AHRS.h>
-#include <Adafruit_LSM6DS33.h>
+// #include <Adafruit_LSM6DS33.h>
+#include <Adafruit_LSM6DSOX.h>
 #include <Arduino.h>
 #include <Preferences.h>
 #include <Wire.h>
@@ -46,7 +47,7 @@ typedef union
 //                                    sensors_event_t &gyro_event,
 //                                    sensors_event_t &mag_event);
 
-extern Adafruit_LSM6DS33 lsm6ds;
+extern Adafruit_LSM6DSOX lsm6ds;
 // extern Adafruit_LIS3MDL lis3mdl;
 class Imu
 {
@@ -67,6 +68,8 @@ class Imu
   float get_yaw();
 
   gravity_vector_t get_gravity_vector();
+
+  void setGain(float gain){filter.setBeta(gain);};
 
   // TODO: NOT IMPLEMENTED because the magdwick filter needs to be updated to
   // return this

@@ -11,18 +11,17 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.289" // updated dynamically from python script
+#define VERSION "1.0.389" // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
 
 // motor parameters
 int pole_pairs = 11;
-float phase_resistance = 0.1088;
-float kv = 500;
+float phase_resistance = 2.15;
 
 // Setup the motor and driver
-BLDCMotor motor = BLDCMotor(pole_pairs, phase_resistance, kv);
+BLDCMotor motor = BLDCMotor(pole_pairs, phase_resistance);
 BLDCDriver6PWM driver =
     BLDCDriver6PWM(CH0_UH, CH0_UL, CH0_VH, CH0_VL, CH0_WH, CH0_WL);
 
@@ -34,7 +33,8 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 CalibratedSensor sensor = CalibratedSensor(encoder0);
 
 // IMU
-Imu::Imu imu(1);
+Imu::Imu imu(0.5);
+float gyro_z_rads = 0;
 
 // atomic variable to adjust mqtt update frequency
 std::atomic<uint8_t> mqtt_update_freq_hz = 10; // default to 100ms (10Hz)
@@ -42,13 +42,13 @@ std::atomic<u_long> time_checker_imu = 0; // for checking the time in the imu.lo
 std::atomic<u_long> time_checker_foc = 0; // for checking the time in the foc loop
 unsigned long last_time_foc = 0; // for checking the time in the loops
 unsigned long last_time_imu = 0; // for checking the time in the imu loop
+std::atomic<float> imu_filter = 0.5; //madgwick filter gain on imu
 
-std::atomic<float> com_vel_p = 0.5;
+std::atomic<float> com_vel_p = 0.3;
 std::atomic<float> com_vel_i = 0.0;
-std::atomic<float> com_vel_d = 0.0;
-std::atomic<float> com_vel_lpf = 0.003;
+std::atomic<float> com_vel_d = 0.0000;
+std::atomic<float> com_vel_lpf = 0.015;
 std::atomic<float> last_commanded_vel_rads = 0.0;
-std::atomic<float> com_feedforward_velocity = 0.0; // default to 10 rad/s
 std::atomic<float> com_target_debug = 0.0; // target for debugging
 
 // global atomic variable for the motor stuff to be set by mqtt
@@ -61,18 +61,20 @@ std::atomic<float> last_offset_rad = 0.0;
 // gains for the inner loop balancing controller
 std::atomic<float> com_bal_p_gain = 0.0;
 std::atomic<float> com_bal_i_gain = 0.0;
-std::atomic<float> com_bal_d_gain = 0.0;
+std::atomic<float> com_bal_d_gain = 0.5;
 
 // flags to flip the x and y dir incase they are wrongly set
 std::atomic<bool> com_x_dir = 0;
 std::atomic<bool> com_y_dir = 0;
 
 // gains for the outer loop correction on the setpoint
-std::atomic<float> com_balance_pt_p_gain = 0.0;
-std::atomic<float> com_balance_pt_i_gain = 0.0;
-std::atomic<float> com_balance_pt_d_gain = 0.0;
+std::atomic<float> com_balance_pt_p_gain = 0.001;
+std::atomic<float> com_balance_pt_i_gain = 0.07;
+std::atomic<float> com_balance_pt_d_gain = 0.000001;
 std::atomic<float> filtered_velocity_for_outer_loop = 0.0;
-std::atomic<float> com_outer_vel_lpf_tf = 0.05; // defaulting to 50ms
+std::atomic<float> com_outer_vel_lpf_tf = 0.5; // defaulting to 500ms
+
+std::atomic<float> com_feedfwd_scale = 0.6;
 
 // motor control flags
 std::atomic<bool> enable_flag = false;
@@ -88,17 +90,62 @@ uint8_t robot_mode = 0;
 
 // balancing PID controller variables ramp and limit are set to max
 // input is IMU and Output is voltage to motor
-float delta_v_ramp_lim = 100.0; // 50 rad/s per timestep
-float max_pid_output = 100.0; // 100 rad/s max output
-PIDController balance_pid = PIDController(0.0, 0.0, 0.0, delta_v_ramp_lim, max_pid_output);
+const float delta_v_ramp_lim = 100.0;
+const float max_pid_output = 100.0;
+PIDController balance_pid = PIDController(0.0, 0.0, 0.5, delta_v_ramp_lim, max_pid_output);
 
 // outer slower loop to correct the setpoint
 // input is the velocity of the motor and output is a small angle correction
-PIDController offset_pt_pid = PIDController(0.0, 0.0, 0.0, 1.0, 1.0);
+LowPassFilter offset_lpf = LowPassFilter(0.5);
+PIDController offset_pt_pid = PIDController(0.001, 0.07, 0.00001, 0.01, 1.0);
 
 // make a separate thread for the OTA
-// TaskHandle_t loop_foc_task;
-esp_timer_handle_t foc_timer;
+TaskHandle_t loop_foc_task;
+float foc_ff = 0;
+float foc_vel = 0;
+unsigned long foc_now_time = 0;
+unsigned long foc_elapsed_time = 0;
+
+// control loop variables
+float balance_point_rad = 0;
+float balance_point_x = 0;
+float balance_point_y = 0;
+float max_balance_point = 0;
+float min_balance_point = 0;
+float offset_rad = 0;
+float raw_velocity = 0;
+float tf = 0;
+float dt = 0;
+float alpha = 0;
+
+float last_vel = 0;
+float x = 0;
+float y = 0;
+float calculated_error_rad = 0;
+float balance_target_delta_rads = 0;
+float new_target_vel = 0;
+
+unsigned long now_time = 0;
+unsigned long elapsed_time = 0;
+
+// for calculating feed forward energy
+std::atomic<float> w_feedback = 0;
+std::atomic<float> w_feedfwd = 0;
+const float _M = 0.263; // measured in kg on my kitchen scale
+const float _H = 0.1; // measured from corner to center of mass in m
+const float _I_WHEEL = 0.000190 + 0.000020 + 0.00010; // inertia of ring, rotor, and holder in kg*m^2
+const float _I_TOTAL_ROBOT = _M * _H * _H; // inertia of whole robot about axis of tipping
+const float _G = 9.81;
+const float _E_GMAX = _M*_G*_H; // this is the max potential energy
+float k_energy_now = 0;
+float gp_energy_now = 0;
+float delta_k_energy = 0;
+std::atomic<float> k_coulomb_damp = 0; // for calculating torque on motor due to constant damp
+std::atomic<float> k_viscous_damp = 0; // for calculating torque on motor due to proportional damp
+float damping_energy_lost_now = 0;
+std::atomic<float> theta = 0; // angle in rads measured from target balance point
+
+// esp_timer_handle_t foc_timer;
 // make a separate thread for the MQTT publishing
 TaskHandle_t mqtt_publish_task;
 void mqtt_publish_thread(void *pvParameters)
@@ -132,17 +179,15 @@ void mqtt_publish_thread(void *pvParameters)
       doc["vel"] = motor.shaft_velocity;
 
       // print the IMU data
-      Imu::gravity_vector_t gravity = imu.get_gravity_vector();
-      doc["gravity_x"] = gravity.x;
-      doc["gravity_y"] = gravity.y;
+      doc["gravity_x"] = x;
+      doc["gravity_y"] = y;
 
       // print balance point in radians
-      float balance_point_rad = com_balance_pt_rad.load();
       float offset_rad = last_offset_rad.load();
       doc["bp_offset_rad"] = offset_rad;
       doc["balance_point_rad"] = balance_point_rad - offset_rad;
       // print the calculated error in radians
-      float error_est = atan2(gravity.y, gravity.x) - balance_point_rad;
+      float error_est = -theta.load();
       doc["bp_error_est"] = error_est;
 
       // print data from the balancing PID
@@ -154,7 +199,8 @@ void mqtt_publish_thread(void *pvParameters)
       
       // print time of control loop
       doc["imu_time"] = time_checker_imu.load();
-      doc["foc_time"] = time_checker_foc.load();
+      doc["feed_fwd"] = w_feedfwd.load();
+      doc["theta"] = theta.load();
 
       // Serialize JSON to string
       char buffer[512];
@@ -190,22 +236,33 @@ void loop_foc_thread(void *pvParameters)
     // loop simplefoc
     // if the last_commanded_vel abs is less than the abs of the feedforward,
     // set the target to the feedforward
-    float feedforward = com_feedforward_velocity.load();
-    float vel = last_commanded_vel_rads.load();
-    if (abs(vel) < abs(feedforward) && vel != 0.0)
+    foc_ff = 0; // for gimbal motors this isn't needed
+    foc_vel = last_commanded_vel_rads.load();
+    if (abs(foc_vel) < abs(foc_ff) && foc_vel != 0.0)
     {
-      vel = (vel/abs(vel)) * feedforward;
+      foc_vel = (foc_vel / abs(foc_vel)) * foc_ff;
     }
-    motor.move(vel); // set the target velocity to the motor
+    motor.move(foc_vel); // set the target velocity to the motor
     motor.loopFOC();
 
-    // start timer for loop in microseconds
-    unsigned long now_time = micros();
-    // find elapsed time
-    unsigned long elapsed_time = now_time - last_time_foc;
-    last_time_foc = now_time;
-    time_checker_foc.store(elapsed_time);
   }
+}
+
+float dot_product(float &a1, float &b1, float &a2, float &b2){
+  // Normalize this stuff
+  float denom = sqrt(a1*a1 + b1*b1) * sqrt(a2*a2 + b2*b2);
+  float dot;
+  if (denom == 0){
+    dot = 1.0;
+  }
+  else
+    dot = (a1 * a2 + b1 * b2) / denom;
+    constrain(dot, -1.0, 1.0);
+  return dot;
+}
+
+float cross(float &a1, float &b1, float &a2, float &b2){
+  return(a1*b2 - a2*b1);
 }
 
 void setup()
@@ -291,8 +348,7 @@ void setup()
 
   // link motor to driver and set up
   motor.linkDriver(&driver);
-  motor.voltage_sensor_align = 1.0;
-  motor.foc_modulation = FOCModulationType::SinePWM;
+  motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
   motor.torque_controller = TorqueControlType::voltage;
   motor.controller = MotionControlType::velocity;
 
@@ -301,19 +357,20 @@ void setup()
   motor.current_limit = 15.0;
   motor.voltage_limit = 15.0;
 
-  motor.PID_velocity.P = 1.25;
+  motor.PID_velocity.P = 1.2;
   motor.PID_velocity.I = 0.0;
-  motor.PID_velocity.D = 0.005;
+  motor.PID_velocity.D = 0.00000;
+  motor.PID_velocity.limit = 100;
 
-  motor.LPF_velocity.Tf = 0.003;
+  motor.LPF_velocity.Tf = 0.015;
   motor.init();
 
   // LPF for outer loop
   filtered_velocity_for_outer_loop.store(0);
-  com_outer_vel_lpf_tf.store(0.05); // 50ms initial tf
+  com_outer_vel_lpf_tf.store(1.0); // 50ms initial tf
 
   // align sensor and start FOC
-  sensor.voltage_calibration = 1.0;
+  sensor.voltage_calibration = 7.0;
 
   // calibrate the sensor and save the alignment
   sensor.calibrate(motor);
@@ -326,32 +383,13 @@ void setup()
                           "MQTT_Publish",      /* String with name of task. */
                           10000,               /* Stack size in bytes. */
                           NULL,                /* Parameter passed as input of the task */
-                          1,                   /* Priority of the task. */
+                          5,                   /* Priority of the task. */
                           &mqtt_publish_task,  /* Task handle. */
                           0);                  /* Core 1 because wifi runs on core 0 */
 
   // task for motor controls
-  // creeate periodic task for foc loop using esp high resolution timer
-  esp_timer_create_args_t foc_timer_args;
-  foc_timer_args.callback = loop_foc_thread;
-  foc_timer_args.arg = NULL;
-  foc_timer_args.name = "foc_timer";
-  foc_timer_args.dispatch_method = ESP_TIMER_TASK;
-  foc_timer_args.skip_unhandled_events = false;
-  
-  esp_err_t err = esp_timer_create(&foc_timer_args, &foc_timer);
-  if (err != ESP_OK)
-  {
-    Serial.println("Failed to create timer");
-  }
-  else
-  {
-    esp_timer_start_periodic(foc_timer, 50);
-    Serial.println("Timer started");
-  }
-
-  // xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
-  //                         &loop_foc_task, 1);
+  xTaskCreatePinnedToCore(loop_foc_thread, "loop_foc", 10000, NULL, 1,
+                          &loop_foc_task, 1);
 
   // start the motor disabled
   motor.disable();
@@ -375,11 +413,12 @@ void loop()
     switch (robot_mode)
     {
     case 1:
+      balance_point_x = x;
+      balance_point_y = y;
     case 0:
       motor.controller = MotionControlType::velocity;
       // set targets to 0
       last_commanded_vel_rads.store(0.0);
-      com_balance_pt_rad.store(0.0);
       com_balance_offset_rad.store(0.0);
       // clear pid
       motor.PID_velocity.reset();
@@ -401,8 +440,8 @@ void loop()
       enable_flag.store(true);
       motor.controller = MotionControlType::velocity;
       // atan2 of gravity vector is the balance point we want to aim at
-      float x = imu.get_gravity_vector().x;
-      float y = imu.get_gravity_vector().y;
+      x = imu.get_gravity_vector().x;
+      y = imu.get_gravity_vector().y;
       if (com_x_dir.load())
       {
         x = -x;
@@ -411,8 +450,8 @@ void loop()
       {
         y = -y;
       }
-      float balance_point_rad = atan2(y, x);
-      com_balance_pt_rad.store(balance_point_rad);
+      balance_point_x = x;
+      balance_point_y = y;
     }
     break;
     default:
@@ -444,53 +483,93 @@ void loop()
     update_pid_flag.store(false);
   }
   // now handle each mode for real
-  // balance at a given point (our initialized best guess or set by a command)
-  float balance_point_rad = com_balance_pt_rad.load();
-  float max_balance_point = balance_point_rad + _PI_6;
-  float min_balance_point = balance_point_rad - _PI_6;
-  float offset_rad = com_balance_offset_rad.load();
+  // balance at a given point (our best guess pre-offsets)
+
   // in debug mode, the offset CAN be set by user, but in mode 3 we will overwrite
   // calculate the offset based on the outer loop
   // the offset should aim to reduce the velocity to zero
-  float raw_velocity = motor.shaft_velocity;
-  float tf = com_outer_vel_lpf_tf.load();
-  float dt = 0.000100;   // 100us  // TODO: make this adjust based on the loop time
-  float alpha = 1.0f; // default for if tf is invalid
-  if (tf > 0)
-  {
-    alpha = constrain((dt / (tf + dt)), 0.0, 1.0);
-  }
-  float last_vel = filtered_velocity_for_outer_loop.load();
-  filtered_velocity_for_outer_loop.store((1 - alpha) * raw_velocity + alpha * last_vel);
+  raw_velocity = motor.shaft_velocity;
+  offset_lpf.Tf = com_outer_vel_lpf_tf.load();
+  filtered_velocity_for_outer_loop.store(offset_lpf(raw_velocity)); // store for mqtt panel
 
-  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop - 10.0f);
-
+  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
   // in mode 2, overwrite the offset with the commanded offset
   if (mode == 2) {
     offset_rad = com_balance_offset_rad.load();
-  } 
+  }
 
-  // add the offset to the balance point
-  balance_point_rad = constrain((balance_point_rad + offset_rad), min_balance_point, max_balance_point);
+  // normally delay the task, but since imu takes so dang long, just assume 2ms ish delay
+  imu.setGain(imu_filter.load());
+  imu.loop();
 
+  // TODO: THE OFFSET NEEDS TO BE CALCULATED INTO THE BALANCE POINT FOR CONTROL MODE 3 TO WORKKKKKK
   // find error based on gravity vector x and y components and current setpoint
-  // the linear approximation is good enough.  assume small angle approximation
-  float x = imu.get_gravity_vector().x;
-  float y = imu.get_gravity_vector().y;
+  x = imu.get_gravity_vector().x;
+  y = imu.get_gravity_vector().y;
+  float dot = dot_product(x, y, balance_point_x, balance_point_y);
+  float acos_val = acos(dot);
 
-  float calculated_error_rad = atan2(y, x) - balance_point_rad;
+  // this constraint saves us from acos() returning nans
+  if (dot >= 1.0){
+    acos_val = 0.0;
+  }
+  else if (dot <= -1)
+  {
+    acos_val = _PI;
+  }
+
+  float theta_signed = copysign(acos_val, cross(x,y,balance_point_x, balance_point_y));
+  theta.store(theta_signed - offset_rad);
+
+  calculated_error_rad = -theta.load(); // error is negative theta
+
+  // first find the feed forward deltaV based on the Energy Equations.
+  // Assuming:
+  // grav pot energy = m*g*cos(theta)  --- where m is mass estimage of robot, g is 10, and theta is error.
+  // kin energy = .5* I*w^2  --- where I is robot inertia estimate and w is current robot tipping vel.
+  
+  // find kinetic energy from gyro data
+  gyro_z_rads = imu.get_raw_gyro_z() * SENSORS_DPS_TO_RADS;
+  k_energy_now = .5 * _I_TOTAL_ROBOT * gyro_z_rads * gyro_z_rads; // this is energy in the positive Z direction
+
+  // calculate simple model of friction: total damping= (k_coulomb* velocity direction) + (k_viscous * velocity)
+  // NOTE: I don't think this is actually in energy units... but also I don't have "correct" real K values...
+  if (abs(last_vel) > 10){
+    damping_energy_lost_now = k_coulomb_damp.load() + last_vel*last_vel * k_viscous_damp.load();
+  }
+  else {
+    damping_energy_lost_now = last_vel * last_vel * k_viscous_damp.load();
+  }
+
+  gp_energy_now = _M * _G * cos(theta.load()) *_H; 
+  float delta_k_energy_grav = (_E_GMAX - gp_energy_now - damping_energy_lost_now);
+  float w_feedfwd_rotation = sqrt(2.0 * abs(k_energy_now) / _I_WHEEL);  // w needed to match energy in rotation
+  float w_feedfwd_grav = sqrt(2.0 * abs(delta_k_energy_grav)/ _I_WHEEL); // w needed to match energy in gpe
+
+  // get signs for rotational and gravity components
+  w_feedfwd_rotation = -copysign(w_feedfwd_rotation, gyro_z_rads); // always counteracting the rotational diff
+  w_feedfwd_grav = -copysign(w_feedfwd_grav, theta_signed); // always counteracting the GPE diff
+
+  // scale feedfwd to gain
+  w_feedfwd.store((w_feedfwd_grav + w_feedfwd_rotation) * com_feedfwd_scale.load());
 
   /*  ------------------------------------------------------------------
    *  get output of balancing pid (delta velocity == delta rad/s)
    *  note that the frequency of calling balance_pid DEFINES the freq of
    *  the control loop */
-  float balance_target_delta_rads = balance_pid(calculated_error_rad);
+  w_feedback.store(balance_pid(calculated_error_rad));
+  balance_target_delta_rads = w_feedback.load() + w_feedfwd.load();
   
   // finally, if the output is too large, set it to the max
-  balance_target_delta_rads = constrain(balance_target_delta_rads, -100.0, 100.0);
+  balance_target_delta_rads = constrain(balance_target_delta_rads, -60.0, 60.0);
+
+  if (abs(balance_target_delta_rads) < .005){
+    balance_target_delta_rads = 0.0;
+  }
 
   // add the delta V to the current velocity to get the new velocity
-  float new_target_vel = (motor.shaft_velocity + balance_target_delta_rads);
+  new_target_vel = (last_commanded_vel_rads.load() + balance_target_delta_rads);
+  new_target_vel = constrain(new_target_vel, -200, 200);
 
   // set the motor commands with our calculated new target unless we are in mode 1
   // in which just pass the debug target to the velocity controller
@@ -501,7 +580,6 @@ void loop()
     //do nothing
   }
   else if (robot_mode == 2 || robot_mode == 3){
-    constrain(new_target_vel, -motor.velocity_limit, motor.velocity_limit);
     last_commanded_vel_rads.store(new_target_vel);
   }
 
@@ -512,11 +590,10 @@ void loop()
   //   Handle OTA updates
   ArduinoOTA.handle();
 
-  // normally delay the task, but since imu takes so dang long, just assume 2ms ish delay
-  imu.loop();
+  last_vel = motor.shaft_velocity;
 
-  unsigned long now_time = micros();
-  unsigned long elapsed_time = now_time - last_time_imu;
+  now_time = micros();
+  elapsed_time = now_time - last_time_imu;
   last_time_imu = now_time;
   time_checker_imu.store(elapsed_time);
 }

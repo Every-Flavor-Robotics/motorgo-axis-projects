@@ -20,7 +20,6 @@ extern std::atomic<uint8_t> mqtt_update_freq_hz;
 extern std::atomic<float> com_vel_p;
 extern std::atomic<float> com_vel_i;
 extern std::atomic<float> com_vel_d;
-extern std::atomic<float> com_feedforward_velocity;
 extern std::atomic<float> com_target_debug;
 extern std::atomic<float> com_balance_pt_rad;
 extern std::atomic<float> com_balance_offset_rad;
@@ -39,6 +38,10 @@ extern std::atomic<bool> disable_flag;
 extern std::atomic<bool> motors_enabled;
 extern std::atomic<uint8_t> com_mode;
 extern std::atomic<bool> update_pid_flag;
+extern std::atomic<float> com_feedfwd_scale;
+extern std::atomic<float> k_coulomb_damp;
+extern std::atomic<float> k_viscous_damp;
+extern std::atomic<float> imu_filter;
 
 void setupMQTT() {
     client.setServer(mqtt_server, mqtt_port);
@@ -48,20 +51,20 @@ void setupMQTT() {
 
 void reconnectMQTT() {
     while (!client.connected()) {
-        Serial.print("Attempting MQTT connection...");
+        //Serial.print("Attempting MQTT connection...");
         String clientId = "Wobbler-";
         clientId += String(WiFi.macAddress());
-        Serial.print("Client ID: ");
-        Serial.println(clientId);
+        //Serial.print("Client ID: ");
+        //Serial.println(clientId);
 
         if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
-            Serial.println("MQTT connected");
+            //Serial.println("MQTT connected");
             client.subscribe(mqtt_ota_topic);    // Subscribe to OTA
             client.subscribe(mqtt_sub_topic);   // Subscribe to commands
         } else {
-            Serial.print("MQTT connection failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" Retrying in 5 seconds...");
+            //Serial.print("MQTT connection failed, rc=");
+            //Serial.print(client.state());
+            //Serial.println(" Retrying in 5 seconds...");
             delay(5000);
         }
     }
@@ -77,26 +80,26 @@ void publishMQTT(const char* payload) {
 
 void publishMQTT(const char* payload, const char* topic) {
     if (client.publish(topic, payload)) {
-        Serial.print("Published message to topic: ");
-        Serial.println(topic);
+        //Serial.print("Published message to topic: ");
+        //Serial.println(topic);
     } else {
-        Serial.println("Failed to publish message");
+        //Serial.println("Failed to publish message");
     }
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-    Serial.print("Message arrived [");
-    Serial.print(topic);
-    Serial.print("] ");
+    //Serial.print("Message arrived [");
+    //Serial.print(topic);
+    //Serial.print("] ");
 
     char message[length + 1];
     memcpy(message, payload, length);
     message[length] = '\0';
-    Serial.println(message);
+    //Serial.println(message);
 
     if (strcmp(topic, mqtt_ota_topic) == 0) {
         if (strcmp(message, "update") == 0) {
-            Serial.println("OTA update requested");
+            //Serial.println("OTA update requested");
             publishMQTT("Starting OTA update", mqtt_ota_status_topic);
         }
     } 
@@ -122,7 +125,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             update_pid_flag.store(true);
         }
         if (doc.containsKey("feedforward")) {
-            com_feedforward_velocity.store(doc["feedforward"].as<float>());
+            com_feedfwd_scale.store(doc["feedforward"].as<float>());
+        }
+        if (doc.containsKey("k_coulomb")) {
+            k_coulomb_damp.store(doc["k_coulomb"].as<float>());
         }
         if (doc.containsKey("target")) {
             com_target_debug.store(doc["target"].as<float>());
@@ -174,6 +180,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             com_outer_vel_lpf_tf.store(doc["outer_vel_lpf_tf"].as<float>());
             update_pid_flag.store(true);
         }
+        if (doc.containsKey("imu_filter")){
+            imu_filter.store(doc["imu_filter"].as<float>());
+        }
         if (doc.containsKey("enable")) {
             bool enable = doc["enable"].as<bool>();
             if (enable) {
@@ -182,10 +191,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 disable_flag.store(false);
             }
         }
-        
     }
 }
-
+    
 bool isMQTTConnected() {
     return client.connected();
 }
