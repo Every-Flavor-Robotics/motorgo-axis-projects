@@ -39,6 +39,8 @@ extern std::atomic<bool> motors_enabled;
 extern std::atomic<uint8_t> com_mode;
 extern std::atomic<bool> update_pid_flag;
 extern std::atomic<float> com_feedfwd_scale;
+extern std::atomic<float> com_fw_rotation_scale;
+extern std::atomic<float> com_fw_gravity_scale;
 extern std::atomic<float> k_coulomb_damp;
 extern std::atomic<float> k_viscous_damp;
 extern std::atomic<float> imu_filter;
@@ -182,6 +184,14 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
         if (doc.containsKey("imu_filter")){
             imu_filter.store(doc["imu_filter"].as<float>());
+        }
+        if (doc.containsKey("fw_rotation"))
+        {
+            com_fw_rotation_scale.store(doc["fw_rotation"].as<float>());
+        }
+        if (doc.containsKey("fw_gravity"))
+        {
+            com_fw_gravity_scale.store(doc["fw_gravity"].as<float>());
         }
         if (doc.containsKey("enable")) {
             bool enable = doc["enable"].as<bool>();

@@ -11,7 +11,7 @@
 #include "axis_wifi_manager.h" // Include our MQTT header
 #include "imu.h"
 #include "pins_arduino.h" // Include our custom pins for AXIS board
-#define VERSION "1.0.389" // updated dynamically from python script
+#define VERSION "1.0.445" // updated dynamically from python script
 
 #include "encoders/calibrated/CalibratedSensor.h"
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
@@ -33,7 +33,7 @@ MagneticSensorMT6701SSI encoder0(CH0_ENC_CS);
 CalibratedSensor sensor = CalibratedSensor(encoder0);
 
 // IMU
-Imu::Imu imu(0.5);
+Imu::Imu imu(0.01);
 float gyro_z_rads = 0;
 
 // atomic variable to adjust mqtt update frequency
@@ -42,12 +42,12 @@ std::atomic<u_long> time_checker_imu = 0; // for checking the time in the imu.lo
 std::atomic<u_long> time_checker_foc = 0; // for checking the time in the foc loop
 unsigned long last_time_foc = 0; // for checking the time in the loops
 unsigned long last_time_imu = 0; // for checking the time in the imu loop
-std::atomic<float> imu_filter = 0.5; //madgwick filter gain on imu
+std::atomic<float> imu_filter = 0.01; //madgwick filter gain on imu
 
 std::atomic<float> com_vel_p = 0.3;
 std::atomic<float> com_vel_i = 0.0;
 std::atomic<float> com_vel_d = 0.0000;
-std::atomic<float> com_vel_lpf = 0.015;
+std::atomic<float> com_vel_lpf = 0.025;
 std::atomic<float> last_commanded_vel_rads = 0.0;
 std::atomic<float> com_target_debug = 0.0; // target for debugging
 
@@ -61,20 +61,22 @@ std::atomic<float> last_offset_rad = 0.0;
 // gains for the inner loop balancing controller
 std::atomic<float> com_bal_p_gain = 0.0;
 std::atomic<float> com_bal_i_gain = 0.0;
-std::atomic<float> com_bal_d_gain = 0.5;
+std::atomic<float> com_bal_d_gain = 0.0;
 
 // flags to flip the x and y dir incase they are wrongly set
 std::atomic<bool> com_x_dir = 0;
 std::atomic<bool> com_y_dir = 0;
 
 // gains for the outer loop correction on the setpoint
-std::atomic<float> com_balance_pt_p_gain = 0.001;
-std::atomic<float> com_balance_pt_i_gain = 0.07;
-std::atomic<float> com_balance_pt_d_gain = 0.000001;
+std::atomic<float> com_balance_pt_p_gain = 0.00;
+std::atomic<float> com_balance_pt_i_gain = 0.001;
+std::atomic<float> com_balance_pt_d_gain = 0.000;
 std::atomic<float> filtered_velocity_for_outer_loop = 0.0;
 std::atomic<float> com_outer_vel_lpf_tf = 0.5; // defaulting to 500ms
 
 std::atomic<float> com_feedfwd_scale = 0.6;
+std::atomic<float> com_fw_rotation_scale = 0.3;
+std::atomic<float> com_fw_gravity_scale = 0.1;
 
 // motor control flags
 std::atomic<bool> enable_flag = false;
@@ -90,14 +92,17 @@ uint8_t robot_mode = 0;
 
 // balancing PID controller variables ramp and limit are set to max
 // input is IMU and Output is voltage to motor
-const float delta_v_ramp_lim = 100.0;
-const float max_pid_output = 100.0;
+const float delta_v_ramp_lim = 200.0;
+const float max_pid_output = 1000;
 PIDController balance_pid = PIDController(0.0, 0.0, 0.5, delta_v_ramp_lim, max_pid_output);
 
 // outer slower loop to correct the setpoint
 // input is the velocity of the motor and output is a small angle correction
 LowPassFilter offset_lpf = LowPassFilter(0.5);
-PIDController offset_pt_pid = PIDController(0.001, 0.07, 0.00001, 0.01, 1.0);
+PIDController offset_pt_pid = PIDController(0.000, 0.00, 0.0000, 0, 100000);
+LowPassFilter gyro_lpf = LowPassFilter(0.05);
+LowPassFilter effort_lpf = LowPassFilter(0.5);
+std::atomic<float> accumulated_effort = 0;
 
 // make a separate thread for the OTA
 TaskHandle_t loop_foc_task;
@@ -112,7 +117,7 @@ float balance_point_x = 0;
 float balance_point_y = 0;
 float max_balance_point = 0;
 float min_balance_point = 0;
-float offset_rad = 0;
+float offset_rad_rate = 0;
 float raw_velocity = 0;
 float tf = 0;
 float dt = 0;
@@ -121,6 +126,7 @@ float alpha = 0;
 float last_vel = 0;
 float x = 0;
 float y = 0;
+std::atomic<float> gyro_z = 0;
 float calculated_error_rad = 0;
 float balance_target_delta_rads = 0;
 float new_target_vel = 0;
@@ -144,6 +150,10 @@ std::atomic<float> k_coulomb_damp = 0; // for calculating torque on motor due to
 std::atomic<float> k_viscous_damp = 0; // for calculating torque on motor due to proportional damp
 float damping_energy_lost_now = 0;
 std::atomic<float> theta = 0; // angle in rads measured from target balance point
+float offset_total = 0;
+float last_offset_total = 0;
+uint16_t timer_offset_rads = 0;
+
 
 // esp_timer_handle_t foc_timer;
 // make a separate thread for the MQTT publishing
@@ -181,11 +191,11 @@ void mqtt_publish_thread(void *pvParameters)
       // print the IMU data
       doc["gravity_x"] = x;
       doc["gravity_y"] = y;
+      doc["gyro_z"] = gyro_z.load();
 
       // print balance point in radians
-      float offset_rad = last_offset_rad.load();
-      doc["bp_offset_rad"] = offset_rad;
-      doc["balance_point_rad"] = balance_point_rad - offset_rad;
+      doc["bp_offset_rad"] = last_offset_rad.load();
+      doc["balance_point_rad"] = balance_point_rad;
       // print the calculated error in radians
       float error_est = -theta.load();
       doc["bp_error_est"] = error_est;
@@ -195,7 +205,7 @@ void mqtt_publish_thread(void *pvParameters)
       doc["balance_target_volts"] = targ_v;
 
       // outer loop velocity lpf
-      doc["outer_vel"] = filtered_velocity_for_outer_loop.load();
+      doc["effort_total"] = accumulated_effort.load();
       
       // print time of control loop
       doc["imu_time"] = time_checker_imu.load();
@@ -367,6 +377,7 @@ void setup()
 
   // LPF for outer loop
   filtered_velocity_for_outer_loop.store(0);
+  accumulated_effort.store(0);
   com_outer_vel_lpf_tf.store(1.0); // 50ms initial tf
 
   // align sensor and start FOC
@@ -420,6 +431,7 @@ void loop()
       // set targets to 0
       last_commanded_vel_rads.store(0.0);
       com_balance_offset_rad.store(0.0);
+      accumulated_effort.store(0);
       // clear pid
       motor.PID_velocity.reset();
       balance_pid.reset();
@@ -433,6 +445,10 @@ void loop()
       last_commanded_vel_rads.store(0.0);
       com_balance_pt_rad.store(0.0);
       com_balance_offset_rad.store(0.0);
+      accumulated_effort.store(0);
+      offset_total = 0;
+      last_offset_total = 0;
+      offset_rad_rate = 0;
       // clear pid
       motor.PID_velocity.reset();
       balance_pid.reset();
@@ -481,6 +497,9 @@ void loop()
     balance_pid.reset();
     offset_pt_pid.reset();
     update_pid_flag.store(false);
+    effort_lpf.Tf = 0.0000001;
+    effort_lpf(0.0);
+    accumulated_effort.store(0);
   }
   // now handle each mode for real
   // balance at a given point (our best guess pre-offsets)
@@ -489,15 +508,10 @@ void loop()
   // calculate the offset based on the outer loop
   // the offset should aim to reduce the velocity to zero
   raw_velocity = motor.shaft_velocity;
-  offset_lpf.Tf = com_outer_vel_lpf_tf.load();
   filtered_velocity_for_outer_loop.store(offset_lpf(raw_velocity)); // store for mqtt panel
-
-  offset_rad = offset_pt_pid(filtered_velocity_for_outer_loop);
-  // in mode 2, overwrite the offset with the commanded offset
-  if (mode == 2) {
-    offset_rad = com_balance_offset_rad.load();
-  }
-
+  
+  effort_lpf.Tf = com_outer_vel_lpf_tf.load();
+  
   // normally delay the task, but since imu takes so dang long, just assume 2ms ish delay
   imu.setGain(imu_filter.load());
   imu.loop();
@@ -519,39 +533,58 @@ void loop()
   }
 
   float theta_signed = copysign(acos_val, cross(x,y,balance_point_x, balance_point_y));
-  theta.store(theta_signed - offset_rad);
+
+  offset_rad_rate = effort_lpf(offset_pt_pid(last_vel) / 100000.0);
+  // offset_total = constrain(offset_total + offset_rad_rate, -1.0, 1.0);
+
+  // in mode 2, overwrite the offset with the commanded offset
+  if (mode == 2)
+  {
+    offset_rad_rate = com_balance_offset_rad.load();
+    accumulated_effort.store(0);
+  }
+
+  offset_total += offset_rad_rate;
+
+  theta.store(constrain(theta_signed - offset_total, -1.0, 1.0)); 
 
   calculated_error_rad = -theta.load(); // error is negative theta
 
   // first find the feed forward deltaV based on the Energy Equations.
   // Assuming:
   // grav pot energy = m*g*cos(theta)  --- where m is mass estimage of robot, g is 10, and theta is error.
-  // kin energy = .5* I*w^2  --- where I is robot inertia estimate and w is current robot tipping vel.
+  // kin energy = .5* I*theta_dot^2  --- where I is robot inertia estimate and theta_dot is current robot tipping vel. from gyro
   
-  // find kinetic energy from gyro data
-  gyro_z_rads = imu.get_raw_gyro_z() * SENSORS_DPS_TO_RADS;
-  k_energy_now = .5 * _I_TOTAL_ROBOT * gyro_z_rads * gyro_z_rads; // this is energy in the positive Z direction
+  // find kinetic energy from gyro data - the robots rotation is in the X-Y plane so we take gyro Z data
+  
+  gyro_z.store(gyro_lpf(imu.get_raw_gyro_z()*SENSORS_DPS_TO_RADS));
+  gyro_z_rads = constrain(gyro_z.load(), -10.0, 10.0);
+  
+  // this energy term is how much energy the robot would have in its body rotation, if its body were moving towards the offset at the given rate
+  // delta w needed to add ang.vel to robot body towards theta
+  float ke_robot_target = .5 * _I_TOTAL_ROBOT * offset_rad_rate * offset_rad_rate;
+  float w_feedfwd_target_theta_dot = sqrt(2.0 * abs(ke_robot_target)/_I_WHEEL);  //TODO:  the math can be simplified on all of these terms.
+  
+  k_energy_now = .5 * _I_TOTAL_ROBOT * gyro_z_rads * gyro_z_rads; // this is energy in the rotation of the robot body right now
+  float ke_rotation = constrain((k_energy_now), 0, _E_GMAX/2); // going to limit this to half the GPE because that seems like a good ceil.
+  float w_feedfwd_rotation = sqrt(2.0 * abs(ke_rotation) / _I_WHEEL);  // delta w needed to cancel robot body momentum
+  
+  gp_energy_now = _M * _G * cos(theta.load()) * _H;  // this is how much gravitational potential energy we have between the max height and the current position
+  float delta_k_energy_grav = (_E_GMAX - gp_energy_now); // this is the component of energy we need to add for fixing the height of the robot
+  float w_feedfwd_grav = sqrt(2.0 * abs(delta_k_energy_grav)/ _I_WHEEL); // w needed to match energy difference in gpe
 
-  // calculate simple model of friction: total damping= (k_coulomb* velocity direction) + (k_viscous * velocity)
-  // NOTE: I don't think this is actually in energy units... but also I don't have "correct" real K values...
-  if (abs(last_vel) > 10){
-    damping_energy_lost_now = k_coulomb_damp.load() + last_vel*last_vel * k_viscous_damp.load();
-  }
-  else {
-    damping_energy_lost_now = last_vel * last_vel * k_viscous_damp.load();
-  }
+  // get signs for all the components
 
-  gp_energy_now = _M * _G * cos(theta.load()) *_H; 
-  float delta_k_energy_grav = (_E_GMAX - gp_energy_now - damping_energy_lost_now);
-  float w_feedfwd_rotation = sqrt(2.0 * abs(k_energy_now) / _I_WHEEL);  // w needed to match energy in rotation
-  float w_feedfwd_grav = sqrt(2.0 * abs(delta_k_energy_grav)/ _I_WHEEL); // w needed to match energy in gpe
-
-  // get signs for rotational and gravity components
-  w_feedfwd_rotation = -copysign(w_feedfwd_rotation, gyro_z_rads); // always counteracting the rotational diff
-  w_feedfwd_grav = -copysign(w_feedfwd_grav, theta_signed); // always counteracting the GPE diff
+  // should always be moving robot body towards theta, implies wheel should always be opposite of theta:
+  w_feedfwd_target_theta_dot = -copysign(w_feedfwd_target_theta_dot, offset_rad_rate); 
+  // always counteracting the rotational diff, which we get from gyro data:
+  w_feedfwd_rotation = -copysign(w_feedfwd_rotation, gyro_z_rads); 
+  // always moving robot body to counteract the GPE diff, implies wheel should always be opposite of theta:
+  w_feedfwd_grav = -copysign(w_feedfwd_grav, theta_signed);
 
   // scale feedfwd to gain
-  w_feedfwd.store((w_feedfwd_grav + w_feedfwd_rotation) * com_feedfwd_scale.load());
+  // TODO: stop using coulomb damping parameter as the scaling for theta dot term - I'm just lazy and its available in the gui to tune with.
+  w_feedfwd.store(w_feedfwd_grav * com_fw_gravity_scale.load() + w_feedfwd_rotation * com_fw_rotation_scale.load() + w_feedfwd_target_theta_dot*k_coulomb_damp.load());
 
   /*  ------------------------------------------------------------------
    *  get output of balancing pid (delta velocity == delta rad/s)
@@ -561,15 +594,20 @@ void loop()
   balance_target_delta_rads = w_feedback.load() + w_feedfwd.load();
   
   // finally, if the output is too large, set it to the max
-  balance_target_delta_rads = constrain(balance_target_delta_rads, -60.0, 60.0);
+  balance_target_delta_rads = constrain(balance_target_delta_rads, -200.0, 200.0);
 
-  if (abs(balance_target_delta_rads) < .005){
-    balance_target_delta_rads = 0.0;
+  // this output is what we will integrate and call our accumulated effort
+
+  if (robot_mode == 3){
+    accumulated_effort.store(effort_lpf(last_vel));
   }
+
+  // if (abs(balance_target_delta_rads) < .005){
+  //   balance_target_delta_rads = 0.0;
+  // }
 
   // add the delta V to the current velocity to get the new velocity
   new_target_vel = (last_commanded_vel_rads.load() + balance_target_delta_rads);
-  new_target_vel = constrain(new_target_vel, -200, 200);
 
   // set the motor commands with our calculated new target unless we are in mode 1
   // in which just pass the debug target to the velocity controller
@@ -585,9 +623,9 @@ void loop()
 
   // store the last values for debugging and logging
   last_balance_target_delta_rads.store(balance_target_delta_rads);
-  last_offset_rad.store(offset_rad);
+  last_offset_rad.store(offset_rad_rate);
 
-  //   Handle OTA updates
+  // Handle OTA updates
   ArduinoOTA.handle();
 
   last_vel = motor.shaft_velocity;
